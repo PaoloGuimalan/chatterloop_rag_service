@@ -1,0 +1,48 @@
+[project]
+name = "rag-service"
+version = "0.1.0"
+description = "Pub/sub-driven RAG indexing and retrieval service backed by Milvus."
+requires-python = ">=3.11"
+dependencies = [
+    "pymilvus>=2.5.4",
+    "openai>=1.60",
+    "tiktoken>=0.8",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "tenacity>=9.0",
+    "redis>=5.2",
+    "numpy>=1.26",
+]
+# NOTE: no database drivers, deliberately. This service reaches chatterloop
+# only through its token-authenticated bot API (see chatterloop/platform/),
+# so pymongo and psycopg2 were removed rather than left available - a
+# dependency that is present is a dependency someone can import.
+
+[project.optional-dependencies]
+# Hosted cross-encoder reranking. Lightweight, no torch.
+cohere = ["cohere>=5.13"]
+# Local cross-encoder reranking. Pulls torch (~2GB) - avoid in slim containers.
+local-rerank = ["sentence-transformers>=3.3"]
+# Google Cloud Pub/Sub transport instead of Redis Streams.
+gcp = ["google-cloud-pubsub>=2.27"]
+dev = ["pytest>=8.3", "pytest-cov>=6.0", "ruff>=0.8"]
+
+[project.scripts]
+rag-service = "rag_service.__main__:main"
+rag-service-cli = "rag_service.cli:main"
+rag-service-bot = "rag_service.bot_service:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["rag_service*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
