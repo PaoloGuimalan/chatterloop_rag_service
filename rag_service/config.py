@@ -50,6 +50,15 @@ class MilvusSettings(BaseSettings):
     bm25_k1: float = 1.2
     bm25_b: float = 0.75
 
+    # Analyzer for the BM25 text field. "english" adds stemming and stop-word
+    # removal and is the right choice against a real Milvus.
+    #
+    # It is configurable because milvus-lite - the embedded, file-backed build
+    # used for local development - supports only "standard" and "jieba", and
+    # rejects collection creation outright otherwise. Without this the service
+    # cannot run embedded at all.
+    bm25_analyzer: str = "english"
+
     max_text_length: int = 16384
     shards: int = 1
     consistency_level: Literal["Strong", "Bounded", "Session", "Eventually"] = "Bounded"
@@ -236,6 +245,9 @@ class ChatterloopSettings(BaseSettings):
     reply_generator: Literal["openai", "stub"] = "stub"
     reply_model: str = "gpt-4o-mini"
     reply_api_key: str = ""
+    # OpenAI-compatible endpoint override, e.g.
+    # https://api.groq.com/openai/v1 . Empty means api.openai.com.
+    reply_base_url: str = ""
     reply_max_tokens: int = 400
     reply_temperature: float = 0.3
 

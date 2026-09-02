@@ -90,12 +90,19 @@ class HttpResponder:
     def __init__(
         self,
         client: BotApiClient,
-        conversation_type: str = "single",
+        conversation_type: str = "",
     ) -> None:
         self.client = client
-        # Only a fallback. `reply_to_conversation` takes the real type per call
-        # where the caller knows it, because a group message sent as "single"
-        # gets the wrong push notification title.
+        # EMPTY by default, deliberately. This used to default to "single",
+        # which was a claim the bot had no business making: it replies into
+        # conversations it did not create and whose type it is not told. One
+        # such reply into a real group rewrote that conversation's type and the
+        # UI began rendering a group as a DM.
+        #
+        # The API now derives the type from the conversation or its realm and
+        # ignores what a sender claims, so the honest value here is "no
+        # opinion". Pass a real type per call only when the caller genuinely
+        # knows it.
         self.conversation_type = conversation_type
 
     def reply_to_conversation(

@@ -62,7 +62,9 @@ def build_schema(settings: MilvusSettings, dim: int) -> Any:
         # Required for BM25: Milvus tokenises this field to build the sparse
         # vector.
         enable_analyzer=True,
-        analyzer_params={"type": "english"},
+        # See MilvusSettings.bm25_analyzer - "english" everywhere real,
+        # "standard" when running against milvus-lite.
+        analyzer_params={"type": settings.bm25_analyzer},
     )
     schema.add_field("created_at", DataType.INT64)
     schema.add_field("meta", DataType.JSON, nullable=True)

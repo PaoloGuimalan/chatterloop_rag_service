@@ -26,6 +26,7 @@ from .chatterloop.replies import (
     OpenAIReplyGenerator,
     ReplyGenerator,
     StubReplyGenerator,
+    default_system_prompt,
 )
 from .chunking import TokenChunker, default_tokenizer
 from .config import Settings, get_settings
@@ -46,13 +47,23 @@ def build_generator(settings: Settings) -> ReplyGenerator:
             return OpenAIReplyGenerator(
                 api_key=key,
                 model=cfg.reply_model,
+                # Addressed by name: the bot is a named participant, and a
+                # reply reads wrong when the model does not know who it is.
+                system_prompt=default_system_prompt(cfg.bot_handle),
                 max_tokens=cfg.reply_max_tokens,
                 temperature=cfg.reply_temperature,
+                base_url=cfg.reply_base_url or None,
             )
         except Exception as exc:
+            # The reason goes in the MESSAGE, not an `extra`. This fallback is
+            # silent by design - the bot keeps running - so the one line it
+            # emits has to carry enough to diagnose it. A plain-text formatter
+            # drops `extra`, which turned a one-word NameError into a long hunt.
             logger.error(
-                "reply generator unavailable, falling back to retrieval-only output",
-                extra={"error": str(exc)},
+                "reply generator unavailable (%s: %s), falling back to "
+                "retrieval-only output",
+                type(exc).__name__,
+                exc,
             )
     return StubReplyGenerator()
 
