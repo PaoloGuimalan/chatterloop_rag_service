@@ -22,12 +22,30 @@ All on developer_service, one origin authenticated by one entity_token.
                    date or an embedded `{date, time}` depending on who wrote
                    the row, so a consumer never has to know that.
 
+  fetch replies    GET  /v1/conversations/{id}/replies
+                   scope `messages.read`. The messages here that reply to one
+                   the BOT wrote - "whose" taken from the token, not from a
+                   parameter. This is the probe that makes answering an
+                   unnamed reply affordable: the realtime frame carries no
+                   message id and no `replyingTo`, so the alternative is a
+                   full history fetch on every message in every conversation
+                   the bot belongs to.
+
   fetch mentions   GET  /v1/mentions/comments
                    scope `notifications.read`. Takes no entity id: it answers
                    for whoever the token belongs to. Comment text lives in
                    Postgres while the mention itself is a Mongo notification,
                    and the endpoint joins them so this service does not reach
                    two stores.
+
+  fetch replies    GET  /v1/comments/replies
+                   scope `notifications.read`. "Somebody replied to a comment
+                   you wrote." Django files those under the same
+                   `post_comment` notification type as "somebody commented on
+                   your post", and only the first is an answer to something
+                   the bot said; the endpoint separates them structurally on
+                   the comment's own `parent_comment_id` rather than on a
+                   display string.
 
   send a reply     POST /v1/messages/send
                    scope `messages.send`. Performs the same fan-out the
@@ -67,17 +85,35 @@ class PlatformMessage:
     message_type: str = "text"
     sender_handle: str = ""
 
+    is_reply: bool = False
+    # The message this one is threaded under, and who wrote it. The author is
+    # resolved by the API rather than looked up here, because the parent is
+    # regularly OUTSIDE the window that was fetched - a follow-up an hour later
+    # replies to a message forty turns back - so deriving it from the returned
+    # slice would read "unknown" exactly when it matters.
+    replying_to: str = ""
+    replying_to_sender_entity_id: str = ""
+    replying_to_sender_handle: str = ""
+
 
 @dataclass(slots=True)
 class PendingMention:
-    """A comment mention discovered in the notification store."""
+    """A comment addressed to the bot, discovered in the notification store."""
 
     comment_id: str
     post_id: str
     author_entity_id: str
     text: str = ""
     author_handle: str = ""
+    # When the NOTIFICATION was written, epoch millis - from its ObjectId,
+    # server-side. Load-bearing rather than informational: unread notifications
+    # are durable and pile up while the bot is offline, and this is the only
+    # thing that distinguishes that backlog from live traffic.
     created_at: int = 0
+    # "mention" or "reply", as the endpoint labelled it. Carried through rather
+    # than inferred from which fetch produced it, so a row stays self-describing
+    # once the two lists are merged.
+    kind: str = "mention"
 
 
 @runtime_checkable
@@ -86,11 +122,29 @@ class MessageFetcher(Protocol):
         """Most recent messages in a conversation, oldest first."""
         ...
 
+    def fetch_replies_to_me(
+        self, conversation_id: str, limit: int
+    ) -> list[PlatformMessage]:
+        """Recent messages in a conversation that reply to one the BOT wrote.
+
+        Oldest first, same as `fetch_recent`. Usually empty, and cheap when it
+        is - which is the whole point, because this runs on messages that did
+        not mention the bot and most of them never will concern it.
+
+        Whose replies is decided by the endpoint from the token's entity. There
+        is no argument for it here because there is no argument for it there.
+        """
+        ...
+
 
 @runtime_checkable
 class MentionFetcher(Protocol):
     def fetch_comment_mentions(self, limit: int) -> list[PendingMention]:
         """Unhandled `comment_mention` notifications for this bot."""
+        ...
+
+    def fetch_comment_replies(self, limit: int) -> list[PendingMention]:
+        """Unhandled "replied to your comment" notifications for this bot."""
         ...
 
 
@@ -129,9 +183,17 @@ class NullMessageFetcher:
         )
         return []
 
+    def fetch_replies_to_me(
+        self, conversation_id: str, limit: int
+    ) -> list[PlatformMessage]:
+        return []
+
 
 class NullMentionFetcher:
     def fetch_comment_mentions(self, limit: int) -> list[PendingMention]:
+        return []
+
+    def fetch_comment_replies(self, limit: int) -> list[PendingMention]:
         return []
 
 

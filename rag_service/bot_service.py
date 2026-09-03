@@ -16,7 +16,7 @@ import signal
 from .chatterloop.bot import ChatterloopBot
 from .chatterloop.consumer import EntityEventConsumer
 from .chatterloop.identity import BotIdentity
-from .chatterloop.policy import MentionOnlyPolicy
+from .chatterloop.policy import AddressedOnlyPolicy
 from .chatterloop.ports import (
     NullMentionFetcher,
     NullMessageFetcher,
@@ -98,7 +98,7 @@ class ChatterloopBotService:
             self.settings.retrieval,
         )
 
-        policy = MentionOnlyPolicy(
+        policy = AddressedOnlyPolicy(
             identity=self.identity,
             cooldown_seconds=cfg.cooldown_seconds,
             max_replies_per_hour=cfg.max_replies_per_hour,
@@ -122,6 +122,9 @@ class ChatterloopBotService:
             mention_fetcher=mention_fetcher,
             history_window=cfg.history_window,
             top_k=cfg.top_k,
+            answer_replies=cfg.answer_replies,
+            reply_probe_window=cfg.reply_probe_window,
+            only_live_events=cfg.only_live_events,
         )
 
         # The stream is scoped server-side to whoever the token belongs to,
@@ -228,9 +231,12 @@ class ChatterloopBotService:
         if not self.settings.chatterloop.respond_to_mentions_only:
             raise NotImplementedError(
                 "respond_to_mentions_only=False is not implemented. Replying to "
-                "unaddressed messages is a product decision with a cost and a "
+                "UNADDRESSED messages is a product decision with a cost and a "
                 "blast radius, and it needs its own gating rules before the "
-                "flag means anything."
+                "flag means anything. Note this is not the switch for answering "
+                "a direct reply without an @handle - that is CHATTERLOOP_"
+                "ANSWER_REPLIES, it is on by default, and a reply aimed at the "
+                "bot is still the bot being addressed."
             )
 
         self.store.ensure_collection()
@@ -242,6 +248,12 @@ class ChatterloopBotService:
                 "channel": self.identity.channel,
                 "responder": type(self.responder).__name__,
                 "generator": type(self.bot.generator).__name__,
+                "answer_replies": self.bot.answer_replies,
+                "only_live_events": self.bot.only_live_events,
+                # The watermark every read-resolved candidate is judged
+                # against. Logged because "why did it ignore that?" is
+                # unanswerable without knowing when the process started.
+                "started_at_ms": self.bot.started_at_ms,
             },
         )
         try:

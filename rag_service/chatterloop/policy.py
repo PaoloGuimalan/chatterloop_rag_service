@@ -2,9 +2,23 @@
 
 Answering is the *exception*, not the default. The bot sees every event on its
 entity's channel - every message in every conversation it belongs to - and
-initially replies only when explicitly addressed. Each rule below is a separate
-reason to stay silent, evaluated cheapest-first, and each returns a reason
-string so "why didn't it answer?" is answerable from the logs.
+replies only when it was addressed. Each rule below is a separate reason to
+stay silent, evaluated cheapest-first, and each returns a reason string so "why
+didn't it answer?" is answerable from the logs.
+
+TWO WAYS TO BE ADDRESSED, and the second is not a loosening of the first:
+
+  * an @mention, which is how a thread with the bot STARTS; and
+  * a direct reply to something the bot itself said, which is how one
+    CONTINUES. Requiring the handle on every turn is ceremony no human
+    conversation has, and its absence was the single thing that made the bot
+    read as a command line rather than a participant.
+
+What has NOT changed is that both are explicit acts aimed at the bot. A reply
+to somebody else's message in a thread the bot happens to be in is still
+nothing to do with it, and whether a reply's parent belongs to the bot is
+decided by the API from the token's own entity - not here, and not by anything
+a message can claim.
 """
 
 from __future__ import annotations
@@ -16,7 +30,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from .identity import BotIdentity
-from .triggers import MentionTrigger
+from .triggers import Trigger, TriggerReason
 
 logger = logging.getLogger(__name__)
 
@@ -36,16 +50,25 @@ class Decision:
         return self.verdict is Verdict.RESPOND
 
 
-RESPOND = Decision(Verdict.RESPOND, "addressed by mention")
+# Kept distinct so the logs say which rule let a reply through. "Addressed" is
+# one word for two quite different situations, and the difference is the first
+# thing anyone will want when a reply looks unwarranted.
+RESPOND_MENTIONED = Decision(Verdict.RESPOND, "addressed by mention")
+RESPOND_REPLIED_TO = Decision(Verdict.RESPOND, "direct reply to the bot")
+
+_RESPOND_BY_REASON = {
+    TriggerReason.MENTION: RESPOND_MENTIONED,
+    TriggerReason.REPLY: RESPOND_REPLIED_TO,
+}
 
 
-class MentionOnlyPolicy:
-    """Reply only to explicit mentions, with loop and flood protection.
+class AddressedOnlyPolicy:
+    """Reply only when addressed, with loop and flood protection.
 
-    The mention requirement is the product rule. The rest is what stops a bot
-    with a mention rule from still being a problem: bots that answer bots,
-    bots that answer themselves, and bots that answer the same thing twice
-    because the bus redelivered.
+    Being addressed - mentioned, or replied to directly - is the product rule.
+    The rest is what stops a bot with that rule from still being a problem:
+    bots that answer bots, bots that answer themselves, and bots that answer
+    the same thing twice because the bus redelivered.
     """
 
     def __init__(
@@ -71,13 +94,17 @@ class MentionOnlyPolicy:
 
     # ------------------------------------------------------------- decision
 
-    def evaluate(self, trigger: MentionTrigger, now: float | None = None) -> Decision:
+    def evaluate(self, trigger: Trigger, now: float | None = None) -> Decision:
         now = time.monotonic() if now is None else now
         scope = trigger.conversation_id or trigger.post_id or "global"
 
         # 1. Never answer yourself. Cheapest check and the one whose failure is
         #    unbounded - a self-reply is itself a message that mentions
-        #    whoever it quotes, which produces another event.
+        #    whoever it quotes, which produces another event. It matters more
+        #    on the reply path than it ever did on the mention path: the bot's
+        #    own answers are threaded under someone else's message, so a bot
+        #    that mistook them for input would answer its own thread forever
+        #    without a single @handle being typed.
         if self.identity.is_self(trigger.author_entity_id):
             return Decision(Verdict.IGNORE, "author is the bot itself")
 
@@ -86,13 +113,16 @@ class MentionOnlyPolicy:
             return Decision(Verdict.IGNORE, "author is on the ignore list")
 
         # 3. At-least-once delivery plus a webapp that reconnects its stream on
-        #    every navigation means repeats are normal, not exceptional.
+        #    every navigation means repeats are normal, not exceptional. The
+        #    reply probe adds a second source of them: it returns a WINDOW of
+        #    recent replies, so every new message in a busy conversation
+        #    re-offers the ones already answered.
         if trigger.dedupe_key and trigger.dedupe_key in self._seen_set:
             return Decision(Verdict.IGNORE, "already handled")
 
-        # 4. A mention we cannot read is not a question we can answer.
+        # 4. Something we cannot read is not a question we can answer.
         if not trigger.is_resolved:
-            return Decision(Verdict.IGNORE, "mention text could not be resolved")
+            return Decision(Verdict.IGNORE, "trigger text could not be resolved")
 
         # 5. Per-conversation cooldown. Someone typing "@bot" five times in a
         #    row wants one answer.
@@ -101,13 +131,24 @@ class MentionOnlyPolicy:
             return Decision(Verdict.IGNORE, "within cooldown for this conversation")
 
         # 6. Hourly ceiling per conversation - the backstop for anything the
-        #    rules above did not anticipate.
+        #    rules above did not anticipate, and the one that bounds the cost
+        #    of a back-and-forth that no longer needs a handle to continue.
         if self._recent_reply_count(scope, now) >= self.max_replies_per_hour:
             return Decision(Verdict.IGNORE, "hourly reply limit reached")
 
-        return RESPOND
+        return _RESPOND_BY_REASON[trigger.reason]
 
     # -------------------------------------------------------------- recording
+
+    def has_seen(self, dedupe_key: str) -> bool:
+        """Whether this key has already been judged.
+
+        Public because the reply probe needs it BEFORE building a trigger. The
+        probe returns a window, so most of what it offers on any given frame is
+        old news; discovering that inside `evaluate` would mean paying for a
+        history fetch to resolve something that is about to be ignored.
+        """
+        return bool(dedupe_key) and dedupe_key in self._seen_set
 
     def record_seen(self, dedupe_key: str) -> None:
         """Mark a trigger as handled, whatever the verdict was.
@@ -123,7 +164,7 @@ class MentionOnlyPolicy:
         self._seen.append(dedupe_key)
         self._seen_set.add(dedupe_key)
 
-    def record_reply(self, trigger: MentionTrigger, now: float | None = None) -> None:
+    def record_reply(self, trigger: Trigger, now: float | None = None) -> None:
         """Called after a reply is actually sent, not when it is decided.
 
         A reply that failed to send should not consume the conversation's

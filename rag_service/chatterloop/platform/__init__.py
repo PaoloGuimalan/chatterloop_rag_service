@@ -37,7 +37,7 @@ from .client import (
     PlatformTransientError,
 )
 from .fetchers import ApiMentionFetcher, ApiMessageFetcher
-from .responder import HttpResponder, build_send_body
+from .responder import HttpResponder, build_comment_body, build_send_body
 
 __all__ = [
     "ApiMentionFetcher",
@@ -47,5 +47,6 @@ __all__ = [
     "PlatformAPIError",
     "PlatformAuthError",
     "PlatformTransientError",
+    "build_comment_body",
     "build_send_body",
 ]

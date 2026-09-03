@@ -1,4 +1,4 @@
-"""The two read seams, now over HTTP.
+"""The read seams, now over HTTP.
 
 What these assert is mostly what they asserted before the cut-over - a
 malformed row costs one item and not the batch, a dead platform yields nothing
@@ -7,7 +7,9 @@ survived the change of transport.
 
 What is new is the last test in each class: the pipeline can no longer name
 whose data it wants. That used to be a discipline; it is now a missing
-parameter.
+parameter - and it stays missing on the reply reads, where the temptation is
+strongest, because "replies to me" one argument away from "replies to anyone"
+is not a boundary at all.
 """
 
 from __future__ import annotations
@@ -162,3 +164,68 @@ class TestApiMentionFetcher:
 
         constructor = inspect.signature(ApiMentionFetcher.__init__)
         assert list(constructor.parameters) == ["self", "client"]
+
+
+class TestReplyReads:
+    """The second read on each seam: being replied to rather than named."""
+
+    def test_replies_come_from_the_replies_route(self):
+        client = FakeClient({"messages": [_message(is_reply=True,
+                                                   replying_to="bot-m9")]})
+        [message] = ApiMessageFetcher(client).fetch_replies_to_me("c1", 25)
+        assert client.calls[0][0] == "/v1/conversations/c1/replies"
+        assert message.is_reply
+        assert message.replying_to == "bot-m9"
+
+    def test_the_parents_author_is_carried_through(self):
+        # The field the whole feature turns on. It is resolved server-side
+        # because the parent is regularly outside the fetched window.
+        client = FakeClient({"messages": [_message(
+            is_reply=True, replying_to="bot-m9",
+            replying_to_sender_entity_id="bot-1",
+            replying_to_sender_handle="assistant",
+        )]})
+        [message] = ApiMessageFetcher(client).fetch_recent("c1", 10)
+        assert message.replying_to_sender_entity_id == "bot-1"
+        assert message.replying_to_sender_handle == "assistant"
+
+    def test_a_plain_message_carries_empty_reply_fields(self):
+        client = FakeClient({"messages": [_message()]})
+        [message] = ApiMessageFetcher(client).fetch_recent("c1", 10)
+        assert message.is_reply is False
+        assert message.replying_to == ""
+        assert message.replying_to_sender_entity_id == ""
+
+    def test_comment_replies_come_from_the_replies_route_and_are_labelled(self):
+        client = FakeClient({"replies": [_mention(text="and the second one?")]})
+        [reply] = ApiMentionFetcher(client).fetch_comment_replies(10)
+        assert client.calls[0][0] == "/v1/comments/replies"
+        assert reply.kind == "reply"
+        assert reply.text == "and the second one?"
+
+    def test_a_mention_row_is_labelled_a_mention(self):
+        client = FakeClient({"mentions": [_mention()]})
+        [mention] = ApiMentionFetcher(client).fetch_comment_mentions(10)
+        assert mention.kind == "mention"
+
+    def test_the_servers_own_label_wins_over_the_route(self):
+        # The endpoint labels every row; the route is only the fallback, so an
+        # API that starts returning both kinds on one route still classifies.
+        client = FakeClient({"mentions": [_mention(kind="reply")]})
+        [mention] = ApiMentionFetcher(client).fetch_comment_mentions(10)
+        assert mention.kind == "reply"
+
+    def test_a_dead_platform_yields_no_replies_rather_than_raising(self):
+        client = FakeClient(error=PlatformAPIError("boom"))
+        assert ApiMessageFetcher(client).fetch_replies_to_me("c1", 25) == []
+        assert ApiMentionFetcher(client).fetch_comment_replies(10) == []
+
+    def test_it_cannot_ask_whose_replies_it_wants(self):
+        # Same property as the mention fetcher above, and for the same reason:
+        # "replies to me" must not be one argument away from "replies to
+        # anyone". The endpoint takes the entity from the token.
+        signature = inspect.signature(ApiMessageFetcher.fetch_replies_to_me)
+        assert list(signature.parameters) == ["self", "conversation_id", "limit"]
+
+        signature = inspect.signature(ApiMentionFetcher.fetch_comment_replies)
+        assert list(signature.parameters) == ["self", "limit"]

@@ -1,12 +1,15 @@
-"""The write seam.
+"""The write seams.
 
 `build_send_body` is unchanged and so are its tests: the fields the platform
 wants did not move, only how they get there (plain JSON to the bot API, which
 re-signs it server-side, instead of a JWT this service would have had to sign
 with a secret it should never hold).
 
-What is new is HttpResponder actually sending, and the properties that keep one
-bad send from taking the loop down with it.
+What is new is the COMMENT half. `reply_to_comment` used to raise, and the test
+below asserted that it did - so a bot addressed in a comment thread generated an
+answer it could not deliver. `POST /v1/comments` is that endpoint, and the tests
+that replaced the assertion are about the two things a client must not get
+wrong: what it sends, and what it does when the send fails.
 """
 
 from __future__ import annotations
@@ -17,7 +20,11 @@ from rag_service.chatterloop.platform.client import (
     PlatformAPIError,
     PlatformAuthError,
 )
-from rag_service.chatterloop.platform.responder import HttpResponder, build_send_body
+from rag_service.chatterloop.platform.responder import (
+    HttpResponder,
+    build_comment_body,
+    build_send_body,
+)
 
 
 class TestBuildSendBody:
@@ -120,10 +127,63 @@ class TestHttpResponder:
             HttpResponder(client).reply_to_conversation("c1", "   ")
         assert client.posts == []
 
-    def test_commenting_is_still_unimplemented_and_says_why(self):
-        # Unimplemented before the cut-over too, so nothing regressed - but the
-        # reason changed from "a bot cannot authenticate" to "that endpoint
-        # does not exist yet", and the message should reflect that.
-        with pytest.raises(NotImplementedError) as excinfo:
-            HttpResponder(FakeClient()).reply_to_comment("p1", "cm1", "hi")
-        assert "comments" in str(excinfo.value)
+    def test_a_comment_reply_posts_to_the_comments_route(self):
+        client = FakeClient()
+
+        assert HttpResponder(client).reply_to_comment("p1", "cm1", "yes") is True
+
+        [(path, body)] = client.posts
+        assert path == "/v1/comments"
+        assert body == {"postID": "p1", "parentID": "cm1", "text": "yes"}
+
+    @pytest.mark.parametrize(
+        "error", [PlatformAPIError("boom"), PlatformAuthError("403")]
+    )
+    def test_a_failed_comment_returns_false_rather_than_raising(self, error):
+        # Same property as a failed message send: one unanswered mention, not a
+        # dead consumer loop. The policy does not charge a failed send against
+        # the conversation's budget, so the next trigger retries.
+        client = FakeClient(error=error)
+        assert HttpResponder(client).reply_to_comment("p1", "cm1", "hi") is False
+
+    def test_an_empty_comment_is_refused_before_the_network(self):
+        client = FakeClient()
+        with pytest.raises(ValueError):
+            HttpResponder(client).reply_to_comment("p1", "cm1", "   ")
+        assert client.posts == []
+
+
+class TestBuildCommentBody:
+    def test_carries_exactly_the_fields_the_route_reads(self):
+        assert set(build_comment_body("p1", "hello", "cm1")) == {
+            "postID",
+            "parentID",
+            "text",
+        }
+
+    def test_no_author_is_ever_sent(self):
+        # The endpoint takes the author from the token. A field for it here
+        # would be a field somebody eventually puts another entity's id in.
+        body = build_comment_body("p1", "hello", "cm1")
+        assert not any("entity" in key.lower() for key in body)
+
+    def test_a_top_level_comment_carries_an_empty_parent(self):
+        assert build_comment_body("p1", "hello")["parentID"] == ""
+
+    def test_the_parent_is_what_was_answered_not_where_it_will_be_stored(self):
+        # Replying to a reply re-parents to the top-level ancestor server-side.
+        # A client must NOT try to predict that: computing a parent id here
+        # would be reimplementing the rule this endpoint exists to own.
+        assert build_comment_body("p1", "x", "a-reply")["parentID"] == "a-reply"
+
+    def test_text_is_trimmed(self):
+        assert build_comment_body("p1", "  hello  ", "cm1")["text"] == "hello"
+
+    @pytest.mark.parametrize("bad", ["", "   ", None])
+    def test_an_empty_comment_is_refused(self, bad):
+        with pytest.raises(ValueError):
+            build_comment_body("p1", bad, "cm1")
+
+    def test_a_missing_post_is_refused(self):
+        with pytest.raises(ValueError):
+            build_comment_body("", "hello", "cm1")

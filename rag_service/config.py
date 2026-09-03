@@ -224,13 +224,45 @@ class ChatterloopSettings(BaseSettings):
     bot_handle: str = ""
     bot_aliases: list[str] = Field(default_factory=list)
 
-    # Mention-only is the initial product rule. Turning it off is not currently
-    # implemented anywhere - the flag exists so that "respond to everything"
-    # has to be a deliberate future change rather than an accident.
+    # Addressed-only is the product rule: the bot answers when named, and when
+    # somebody replies directly to something it said. Turning this off - i.e.
+    # replying to unaddressed messages - is not implemented anywhere. The flag
+    # exists so that "respond to everything" has to be a deliberate future
+    # change rather than an accident.
+    #
+    # Keeps its original name because it is an environment variable that live
+    # deployments already set, and the meaning it names is unchanged: only
+    # what counts as "addressed" grew.
     respond_to_mentions_only: bool = True
 
-    # Entities that never get a reply. Put other bots here: two mention-
-    # answering bots in one realm will otherwise talk to each other forever.
+    # Whether a direct reply to one of the bot's own messages or comments
+    # counts as addressing it, with no @handle needed. Off, the bot is
+    # mention-only exactly as before, and a message that does not name it costs
+    # no read at all.
+    answer_replies: bool = True
+
+    # How many recent replies the probe looks at per conversation. Bounds the
+    # work per frame; the server-side route bounds the scan the same way.
+    reply_probe_window: int = 25
+
+    # Answer ONLY what happened while this process was listening.
+    #
+    # Frames are live by construction - pub/sub has no replay. The reads that
+    # resolve them are not: the reply probe returns a window, and comment
+    # notifications are durable and accumulate indefinitely while the bot is
+    # down. With this off, a restart works through that backlog and every
+    # queued row becomes a real reply to a real person about something they
+    # said hours ago.
+    #
+    # The cost, stated plainly: a comment mention that lands during a deploy is
+    # never answered. A notification the bot did not see live is one it will
+    # never see. Turn this off only for a deliberate catch-up run, and expect
+    # the burst.
+    only_live_events: bool = True
+
+    # Entities that never get a reply. Put other bots here: two bots in one
+    # realm that both answer when addressed will otherwise talk to each other
+    # forever.
     ignore_entity_ids: list[str] = Field(default_factory=list)
 
     cooldown_seconds: float = 5.0

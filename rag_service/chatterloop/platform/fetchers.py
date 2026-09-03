@@ -1,6 +1,7 @@
-"""The two read seams, implemented against the platform's developer API.
+"""The read seams, implemented against the platform's developer API.
 
-These satisfy `MessageFetcher` and `MentionFetcher` from ports.py.
+These satisfy `MessageFetcher` and `MentionFetcher` from ports.py - two reads
+each, one for being named and one for being replied to.
 
 WHAT MOVED SERVER-SIDE IN THE CUT-OVER
 --------------------------------------
@@ -39,17 +40,38 @@ logger = logging.getLogger(__name__)
 
 
 class ApiMessageFetcher:
-    """Recent conversation history, from `GET /v1/conversations/.../messages`."""
+    """Conversation reads, from the two `/v1/conversations/...` routes."""
 
     def __init__(self, client: BotApiClient) -> None:
         self.client = client
 
     def fetch_recent(self, conversation_id: str, limit: int) -> list[PlatformMessage]:
+        return self._fetch(
+            conversation_id, "messages", limit, "could not read conversation history"
+        )
+
+    def fetch_replies_to_me(
+        self, conversation_id: str, limit: int
+    ) -> list[PlatformMessage]:
+        """Messages here that reply to one the bot wrote.
+
+        Whose replies is NOT a parameter - the endpoint answers for the token's
+        own entity. That is what keeps "reply to me without naming me" from
+        widening into "reply to anyone", and it is enforced somewhere this
+        service cannot reach.
+        """
+        return self._fetch(
+            conversation_id, "replies", limit, "could not read conversation replies"
+        )
+
+    def _fetch(
+        self, conversation_id: str, route: str, limit: int, failure: str
+    ) -> list[PlatformMessage]:
         if not conversation_id:
             return []
         try:
             payload = self.client.get(
-                f"/v1/conversations/{conversation_id}/messages",
+                f"/v1/conversations/{conversation_id}/{route}",
                 {"limit": max(1, limit)},
             )
         except PlatformAuthError as exc:
@@ -63,7 +85,7 @@ class ApiMessageFetcher:
             return []
         except PlatformAPIError as exc:
             logger.error(
-                "could not read conversation history",
+                failure,
                 extra={"conversation_id": conversation_id, "error": str(exc)},
             )
             return []
@@ -88,15 +110,23 @@ class ApiMessageFetcher:
                     created_at=_int(row.get("created_at")),
                     message_type=str(row.get("message_type") or "text"),
                     sender_handle=str(row.get("sender_handle") or ""),
+                    is_reply=bool(row.get("is_reply")),
+                    replying_to=str(row.get("replying_to") or ""),
+                    replying_to_sender_entity_id=str(
+                        row.get("replying_to_sender_entity_id") or ""
+                    ),
+                    replying_to_sender_handle=str(
+                        row.get("replying_to_sender_handle") or ""
+                    ),
                 )
             )
         return messages
 
 
 class ApiMentionFetcher:
-    """Comment mentions, from `GET /v1/mentions/comments`.
+    """Comment activity addressed to the bot, from the two notification routes.
 
-    Takes no entity id - see the module docstring. The endpoint answers for
+    Neither takes an entity id - see the module docstring. They answer for
     whoever the token belongs to and nobody else.
     """
 
@@ -104,29 +134,49 @@ class ApiMentionFetcher:
         self.client = client
 
     def fetch_comment_mentions(self, limit: int) -> list[PendingMention]:
+        return self._fetch(
+            "/v1/mentions/comments", "mentions", "mention", limit,
+            "could not read comment mentions",
+        )
+
+    def fetch_comment_replies(self, limit: int) -> list[PendingMention]:
+        """Comments replying to one the bot wrote.
+
+        A separate route rather than a flag, because server-side these are a
+        different notification type with a different rule for what counts:
+        Django files "replied to your comment" and "commented on your post"
+        under one type, and only the first is an answer to something the bot
+        said. The endpoint does that separation; this fetcher only labels.
+        """
+        return self._fetch(
+            "/v1/comments/replies", "replies", "reply", limit,
+            "could not read comment replies",
+        )
+
+    def _fetch(
+        self, path: str, key: str, kind: str, limit: int, failure: str
+    ) -> list[PendingMention]:
         try:
-            payload = self.client.get(
-                "/v1/mentions/comments", {"limit": max(1, limit)}
-            )
+            payload = self.client.get(path, {"limit": max(1, limit)})
         except PlatformAuthError as exc:
             logger.error(
-                "not permitted to read mentions", extra={"error": str(exc)}
+                "not permitted to read notifications", extra={"error": str(exc)}
             )
             return []
         except PlatformAPIError as exc:
-            logger.error("could not read comment mentions", extra={"error": str(exc)})
+            logger.error(failure, extra={"error": str(exc)})
             return []
 
         pending: list[PendingMention] = []
-        for row in payload.get("mentions") or []:
+        for row in payload.get(key) or []:
             if not isinstance(row, dict):
                 continue
             comment_id = row.get("comment_id")
             text = row.get("text")
             if not comment_id or not isinstance(text, str) or not text.strip():
-                # The endpoint already drops textless mentions; this is the
-                # belt to that braces, because an unanswerable trigger reaching
-                # the policy is worse than one dropped twice.
+                # The endpoint already drops textless rows; this is the belt to
+                # that braces, because an unanswerable trigger reaching the
+                # policy is worse than one dropped twice.
                 continue
             pending.append(
                 PendingMention(
@@ -136,6 +186,9 @@ class ApiMentionFetcher:
                     text=text,
                     author_handle=str(row.get("author_handle") or ""),
                     created_at=_int(row.get("created_at")),
+                    # The endpoint labels every row; the route it came from is
+                    # the fallback, so an older API still yields the right kind.
+                    kind=str(row.get("kind") or kind),
                 )
             )
         return pending

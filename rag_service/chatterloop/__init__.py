@@ -1,7 +1,8 @@
 """Acting as a user on the chatterloop platform.
 
-Subscribes to the bot entity's realtime channel, and - initially - replies only
-when explicitly mentioned in a message or a comment.
+Subscribes to the bot entity's realtime channel and replies only when
+addressed: named with an @handle, or replied to directly in a message or a
+comment. Everything else on the channel is read and dropped.
 """
 
 from .bot import BotStats, ChatterloopBot
@@ -15,7 +16,7 @@ from .mentions import (
     normalise_handle,
     strip_mentions,
 )
-from .policy import Decision, MentionOnlyPolicy, Verdict
+from .policy import AddressedOnlyPolicy, Decision, Verdict
 from .ports import (
     MentionFetcher,
     MessageFetcher,
@@ -27,9 +28,10 @@ from .ports import (
     Responder,
 )
 from .replies import OpenAIReplyGenerator, ReplyGenerator, StubReplyGenerator
-from .triggers import MentionSource, MentionTrigger
+from .triggers import Trigger, TriggerReason, TriggerSource
 
 __all__ = [
+    "AddressedOnlyPolicy",
     "BotIdentity",
     "BotStats",
     "ChatterloopBot",
@@ -39,9 +41,6 @@ __all__ = [
     "Frame",
     "MENTION_PATTERN",
     "MentionFetcher",
-    "MentionOnlyPolicy",
-    "MentionSource",
-    "MentionTrigger",
     "Mentioner",
     "MessageFetcher",
     "MessagesListPayload",
@@ -54,6 +53,9 @@ __all__ = [
     "ReplyGenerator",
     "Responder",
     "StubReplyGenerator",
+    "Trigger",
+    "TriggerReason",
+    "TriggerSource",
     "Verdict",
     "conversation_tenant",
     "extract_handles",

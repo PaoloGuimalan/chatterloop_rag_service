@@ -246,28 +246,51 @@ these before trusting the service with real data.
 
 A second entrypoint (`make bot` / `python -m rag_service.bot_service`) runs
 the same pipeline as a **platform participant** rather than a bus consumer. It
-subscribes to a bot entity's realtime channel and — initially — replies only
-when explicitly mentioned.
+subscribes to a bot entity's realtime channel and replies only when
+**addressed** — named with an `@handle`, or replied to directly.
 
 ```
-events_<bot_entity_id>   (Redis pub/sub, the channel SSE is bridged from)
+events_<bot_entity_id>   (SSE from developer_service, bridged off Redis pub/sub)
         │
-        ├── messages_list ── mentioner != null? ──no──> silence
-        │                            │yes
-        ├── notifications ───────────┤ (poll the notification store for
-        │                            │  type == "comment_mention")
-        │                            v
-        │                      MentionTrigger
-        │                            │
-        │                fetch conversation, index it
-        │                            │
-        │                    policy.evaluate()
-        │                     │            │
-        │                  IGNORE       RESPOND
-        │                (with reason)     │
-        │                                  v
-        └──────────────────>  retrieve → generate → reply
+        ├── messages_list ── from us? ──yes──> silence
+        │                       │no
+        │                       ├─ mentioner != null ───────────> MENTION
+        │                       │
+        │                       └─ else: GET .../replies ─────────> REPLY
+        │                          (threaded under one of ours?)
+        │                                     │
+        ├── notifications ── poll BOTH stores ────────────> MENTION / REPLY
+        │     (comment mentions, and replies to our comments)
+        │                                     v
+        │                                  Trigger
+        │                                     │
+        │                       fetch conversation, index it
+        │                                     │
+        │                             policy.evaluate()
+        │                              │            │
+        │                           IGNORE       RESPOND
+        │                         (with reason)     │
+        │                                           v
+        └─────────────────────────────>  retrieve → generate → reply
 ```
+
+### Two ways to be addressed
+
+A bot that only answers `@handle` cannot hold a conversation — every turn has
+to re-address it. So being **replied to** counts as well:
+
+| | how it starts | what the bot needs |
+|---|---|---|
+| **mention** | somebody types `@assistant` | nothing — the frame says so |
+| **reply** | somebody replies to a message or comment the bot wrote | one cheap read |
+
+This is not a loosening. Both are explicit acts aimed at the bot, and whether a
+reply's parent belongs to the bot is decided **server-side from the token's own
+entity** — not here, and not by anything a message can claim. A reply to
+somebody *else* in a thread the bot is in is still none of its business.
+
+`CHATTERLOOP_ANSWER_REPLIES=false` turns the whole path off: mention-only
+exactly as before, and a message that does not name the bot costs no read.
 
 ### What the platform actually gives us
 
@@ -287,14 +310,33 @@ replaying a bus.
 handler resolves handles against the conversation's member list and publishes
 `isMentioned ? mentioner : null` *per recipient*. So `mentioner != null` is an
 authoritative, server-side signal and the bot trusts it rather than re-deriving
-it. That is the gate, and nothing downstream of it runs without it.
+it. A frame carrying one needs no read at all to classify.
+
+**But it says nothing about replies, and cannot be made to.** The frame has no
+message id and no `replyingTo`, and the publisher is the platform's own Node
+route — a human replying to the bot never goes near `developer_service`, so
+enriching the frame from this side would cover only the bot's own messages. The
+only honest answer is to read, and the read is a purpose-built route
+(`GET /v1/conversations/{id}/replies`) returning the messages here that are
+threaded under one of **ours**, scoped to the token's entity. Usually empty, two
+indexed lookups when it is not — against a full history window on every message
+in every conversation, which is what asking the question client-side would cost.
+
+One consequence worth knowing: the probe reads a *window* of recent replies, so
+a reply that arrived while the bot was down is picked up on the next frame in
+that conversation rather than being lost — the same "the database is the record,
+the stream is only a hint" property that already covers missed mentions. It also
+means a late answer is possible; the dedupe set and the per-conversation
+cooldown bound it.
 
 **But no frame carries content.** `messages_list` has `conversationID`, the
 sender and the mentioner — no message text, not even a message id. The webapp
 responds by refetching, and the bot has to as well. `notifications` is worse: it
 names no subject at all (sse.ts says so in as many words), so comment mentions
 are discovered by reading the notification store, where the rows carry
-`target_id` (post) and `target_anchor` (comment).
+`target_id` (post) and `target_anchor` (comment). That same shapelessness is why
+the reply half needed no new frame: one ping already means "go and look", and
+there are now two places to look.
 
 **Consequence: indexing is lazy, and that is forced.** There is nothing to index
 at the moment a message arrives. The bot fetches recent history when addressed
@@ -328,23 +370,32 @@ make parity   # defaults to ../.. - this service is a sibling of server/ and web
 
 ### Why it stays quiet
 
-Silence is the default; every reason is logged. Beyond the mention requirement:
+Silence is the default; every reason is logged. Beyond being addressed at all:
 
-- **Never replies to itself.** Checked before any fetch. A self-reply is itself
-  a message, so this failure is unbounded rather than merely wasteful.
+- **Never replies to itself.** Checked before any fetch, and now before the
+  mention check too, since a frame without a mention is no longer free. This
+  matters more on the reply path than it ever did on the mention path: the
+  bot's own answers are *themselves* replies, threaded under somebody else's
+  message, so a bot that read them back would sustain a thread with itself that
+  needs no `@handle` at all.
 - **Never replies to entities on the ignore list** — put other bots there.
-- **Deduplicates** on message/comment id. The webapp reopens its SSE stream on
-  navigation, so repeats are normal.
-- **Won't answer a mention it can't read.** With the read path unwired, that is
-  every message mention: the bot reads events, decides correctly, and says
+- **Deduplicates** on message/comment id — the object, not the route it arrived
+  on, so a message that both mentions the bot and replies to it is answered
+  once. The webapp reopens its SSE stream on navigation, so repeats are normal;
+  the reply probe adds a second source of them, because it returns a window and
+  re-offers what was already answered. Those are dropped *before* the history
+  fetch, not after.
+- **Won't answer something it can't read.** With the read path unwired, that is
+  every message trigger: the bot reads events, decides correctly, and says
   nothing.
 - **Per-conversation cooldown and hourly ceiling.** `record_reply` is called
   after a successful send, not on decision, so a broken outbound path cannot
-  rate-limit the bot into silence.
+  rate-limit the bot into silence. The ceiling is also what bounds the cost of a
+  back-and-forth that no longer needs a handle to continue.
 
 ### Replies are threaded
 
-The bot answers as a **threaded reply to the message that mentioned it** —
+The bot answers as a **threaded reply to the message that addressed it** —
 `isReply: true`, `replyingTo: <messageID>` on the outgoing `/sendMessage` JWT.
 `replyingTo` is a bare message id string, matching how the webapp arms a reply
 (`setisReplying({isReply: true, replyingTo: cnvs.messageID})` in
@@ -361,7 +412,10 @@ detached from its question.
 The target is the most recent message **from the entity named in the frame**
 that actually addresses the bot, scanning backwards and skipping the bot's own
 messages. Not simply the newest message in the window: between the mention and
-the fetch completing, anyone may have spoken.
+the fetch completing, anyone may have spoken. The reply path narrows the same
+way — the probe may legitimately return replies from several people, and
+answering one belonging to a different frame would thread the answer under the
+wrong turn.
 
 ### Tenancy
 
@@ -384,8 +438,11 @@ touch chatterloop's stores even by mistake.
 |---|---|---|
 | realtime frames | `GET /v1/events` (SSE) | `events.subscribe` |
 | read messages | `GET /v1/conversations/{id}/messages` | `messages.read` |
+| read replies to us | `GET /v1/conversations/{id}/replies` | `messages.read` |
 | read comment mentions | `GET /v1/mentions/comments` | `notifications.read` |
+| read comment replies | `GET /v1/comments/replies` | `notifications.read` |
 | send a reply | `POST /v1/messages/send` | `messages.send` |
+| post a comment | `POST /v1/comments` | `comments.create` |
 
 Authorization is an **intersection**: a request is allowed only if the scope is
 on the token *and* the owning entity has been explicitly granted the
@@ -398,7 +455,10 @@ and are now structurally impossible:
 - **It cannot read anyone else's data.** `fetch_comment_mentions` takes no
   entity id and the event stream takes no channel — both resolve to whoever the
   token belongs to, server-side. Reading someone else's notifications is not
-  something this code can express.
+  something this code can express. The same holds for the two reply reads,
+  where the temptation is strongest: `fetch_replies_to_me` takes a conversation
+  and a limit and nothing else, because "replies to me" one argument away from
+  "replies to anyone" is not a boundary at all.
 - **It cannot reach a conversation it is not in.** The messages endpoint
   refuses a conversation the entity is not a participant of, and returns 404
   rather than 403 so an outsider cannot tell an existing conversation from one
@@ -411,10 +471,21 @@ Two things stay deliberately unconnected:
 | `PLATFORM_ENABLED=false` | `Null*Fetcher` / `RecordingResponder` | connects to the bus, gates correctly, generates what it *would* say, records it |
 | no `PLATFORM_TOKEN` | same | the client refuses to construct rather than failing per request |
 
-Replying to a **comment** mention is still unimplemented: comment creation is a
-Django newsfeed surface with its own two-level thread flattening and mention
-fan-out, and there is no developer-API endpoint for it yet. Message replies
-work.
+All four paths now work end to end. Commenting used to be the half that did
+not: `reply_to_comment` raised, so a comment trigger was detected, gated,
+retrieved for, generated — and then dropped. `POST /v1/comments` closed that,
+and it owns the parts that made commenting hard to do from a client: two-level
+thread flattening, the reply notification, and the mention fan-out.
+
+The bot passes the comment it is answering as `parentID` and does **not** try to
+predict where the row will be stored. Replying to a reply re-parents to the
+top-level ancestor server-side, and a client computing that itself would be
+reimplementing the rule it is calling the endpoint to avoid.
+
+One side effect the endpoint does not perform: a hashtag in a comment does not
+tag the parent post. Reproducing it would mean widening the interest taxonomy
+from a fifth implementation of a normaliser whose failure mode is a silent
+duplicate row — see the `developer_service` README.
 
 Set `CHATTERLOOP_REPLY_GENERATOR=openai` for real prose; the default `stub`
 generator reports what was retrieved instead, which keeps retrieval quality
