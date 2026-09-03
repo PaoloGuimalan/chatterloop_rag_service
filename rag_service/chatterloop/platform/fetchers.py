@@ -64,6 +64,40 @@ class ApiMessageFetcher:
             conversation_id, "replies", limit, "could not read conversation replies"
         )
 
+    def conversation_type(self, conversation_id: str) -> str:
+        """ "single" for a DM, something else otherwise - empty if unresolvable.
+
+        Reuses the SAME endpoint `fetch_recent` does, not a dedicated one:
+        `GET /v1/conversations/{id}/messages` already resolves and returns
+        `conversation_type` for the membership check alone, before it even
+        reads a message (LoadConversation, in developer_service's
+        internal/platform/messages.go). `limit=1` asks for the one field this
+        needs without paying for `history_window` messages just to read it -
+        the OPPOSITE of the reply probe (`/replies`), which deliberately does
+        NOT resolve this (its own comment: "a read that answers nothing is
+        worth not making" - conversation_type is exactly that, on that path).
+        """
+        if not conversation_id:
+            return ""
+        try:
+            payload = self.client.get(
+                f"/v1/conversations/{conversation_id}/messages", {"limit": 1}
+            )
+        except PlatformAuthError as exc:
+            logger.error(
+                "not permitted to read this conversation",
+                extra={"conversation_id": conversation_id, "error": str(exc)},
+            )
+            return ""
+        except PlatformAPIError as exc:
+            logger.error(
+                "could not read conversation type",
+                extra={"conversation_id": conversation_id, "error": str(exc)},
+            )
+            return ""
+        value = payload.get("conversation_type")
+        return value if isinstance(value, str) else ""
+
     def _fetch(
         self, conversation_id: str, route: str, limit: int, failure: str
     ) -> list[PlatformMessage]:

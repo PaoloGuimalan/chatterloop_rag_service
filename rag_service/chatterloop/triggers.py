@@ -1,10 +1,12 @@
 """Normalised "something addressed me" events.
 
-Four routes converge here so that the policy and the responder only ever see
+Five routes converge here so that the policy and the responder only ever see
 one shape:
 
     MESSAGE  + MENTION   messages_list frame with a non-null `mentioner`
     MESSAGE  + REPLY     a message threaded under one of the bot's own
+    MESSAGE  + DM        any message at all, in a conversation with no third
+                         party it could instead be aimed at
     COMMENT  + MENTION   an unaddressed `notifications` ping, resolved against
                          the comment-mention store
     COMMENT  + REPLY     the same ping, resolved against the comment-reply store
@@ -12,7 +14,8 @@ one shape:
 The SOURCE says which surface it happened on and therefore how to answer it.
 The REASON says why the bot is entitled to answer at all, which is the product
 rule: a mention is an invitation to speak, a reply is a conversation already in
-progress. Both are recorded on the trigger because "why did it answer that?"
+progress, and a DM has no third option - there is nobody else the message could
+be about. Both are recorded on the trigger because "why did it answer that?"
 is a question the logs have to be able to settle.
 """
 
@@ -32,17 +35,26 @@ class TriggerReason(StrEnum):
     """Why this counts as being addressed.
 
     MENTION is the original rule and still the only way to START a thread with
-    the bot. REPLY covers a message or comment aimed directly at something the
-    bot itself said, where re-typing the handle every turn would be the kind of
-    ceremony no human conversation has.
+    the bot in a GROUP conversation. REPLY covers a message or comment aimed
+    directly at something the bot itself said, where re-typing the handle every
+    turn would be the kind of ceremony no human conversation has.
 
-    Deliberately NOT a third value for "replied to somebody else in a thread
-    the bot is in". That is ordinary conversation between other people, and the
-    bot has no business in it.
+    DM is neither of those and needs no @handle or reply-threading check at
+    all: in a single conversation the bot is one of exactly two participants,
+    so every message from the other one is addressed to it by construction -
+    there is no group of onlookers a message could instead be small talk
+    between. Requiring "@bot" on every turn of a DM would be the same ceremony
+    REPLY already removed from group threads, just for the case where it never
+    made sense to begin with.
+
+    Deliberately NOT a value for "replied to somebody else in a thread the bot
+    is in" (a GROUP, not a DM). That is ordinary conversation between other
+    people, and the bot has no business in it.
     """
 
     MENTION = "mention"
     REPLY = "reply"
+    DM = "dm"
 
 
 @dataclass(slots=True)

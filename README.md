@@ -274,23 +274,42 @@ events_<bot_entity_id>   (SSE from developer_service, bridged off Redis pub/sub)
         └─────────────────────────────>  retrieve → generate → reply
 ```
 
-### Two ways to be addressed
+### Three ways to be addressed
 
 A bot that only answers `@handle` cannot hold a conversation — every turn has
-to re-address it. So being **replied to** counts as well:
+to re-address it. So being **replied to** counts as well, and in a **DM**,
+where the bot is one of exactly two participants, *every message* does:
 
 | | how it starts | what the bot needs |
 |---|---|---|
 | **mention** | somebody types `@assistant` | nothing — the frame says so |
 | **reply** | somebody replies to a message or comment the bot wrote | one cheap read |
+| **DM** | any message, in a single conversation | one cheap read, cached forever after |
 
-This is not a loosening. Both are explicit acts aimed at the bot, and whether a
-reply's parent belongs to the bot is decided **server-side from the token's own
-entity** — not here, and not by anything a message can claim. A reply to
-somebody *else* in a thread the bot is in is still none of its business.
+This is not a loosening. All three are explicit acts aimed at the bot. Whether
+a reply's parent belongs to the bot is decided **server-side from the token's
+own entity** — not here, and not by anything a message can claim — and a reply
+to somebody *else* in a **group** thread the bot is in is still none of its
+business. A DM is different in kind, not just degree: there is no group of
+onlookers a message there could instead be small talk between, so requiring an
+`@handle` on every turn of a 1:1 would be the exact ceremony the reply rule
+above already removed from group threads — just for a case where it never
+applied in the first place.
 
-`CHATTERLOOP_ANSWER_REPLIES=false` turns the whole path off: mention-only
-exactly as before, and a message that does not name the bot costs no read.
+The realtime frame never says what kind of conversation a message landed in
+(`messages_list` carries no such field — see `frames.py`), so the DM check
+reads it from `GET /v1/conversations/{id}/messages` with `limit=1`, the SAME
+endpoint the mention/reply paths already call for history, just asking for the
+one field this needs. A conversation's type never changes once created, so
+this is cached **per conversation, forever** after the first resolution — a
+busy DM pays for this once over its whole lifetime, not once per message. A
+group the bot is freshly added to still pays it once, on its first unaddressed
+message, for the same reason: there is no way to know in advance.
+
+`CHATTERLOOP_ANSWER_REPLIES=false` and `CHATTERLOOP_ANSWER_DMS=false` each turn
+off their own path independently. Both false is mention-only, exactly as the
+bot behaved before either existed, and a message that does not name it costs
+no read at all.
 
 ### What the platform actually gives us
 
@@ -487,9 +506,137 @@ tag the parent post. Reproducing it would mean widening the interest taxonomy
 from a fifth implementation of a normaliser whose failure mode is a silent
 duplicate row — see the `developer_service` README.
 
-Set `CHATTERLOOP_REPLY_GENERATOR=openai` for real prose; the default `stub`
-generator reports what was retrieved instead, which keeps retrieval quality
-debuggable separately from generation quality.
+### Generating the reply: vendor-switchable, tool-calling, retried
+
+`CHATTERLOOP_REPLY_GENERATOR` picks what turns retrieved context into prose:
+
+| value | what runs |
+|---|---|
+| `stub` (default) | reports what was retrieved instead of composing anything — keeps retrieval quality debuggable separately from generation quality, and needs no key |
+| `openai` | OpenAI, via the `openai` SDK |
+| `groq` | Groq, via the `groq` SDK (`pip install -e ".[groq]"`) |
+
+Both real vendors run through the **same** code —
+`chatterloop.replies.ChatCompletionReplyGenerator` — parameterized by a small
+`ChatProvider` (which SDK class to build, which of its exception types mean
+"try again"). Switching vendors is changing `CHATTERLOOP_REPLY_GENERATOR`;
+nothing else in the pipeline changes shape. This mirrors
+`NeonCentralized_API`'s `LLMFactory.create(service, api_key, model)`
+(`llm/services/llm_factory.py`) with one difference on purpose: Neon
+hand-duplicates the completion/tool-loop logic once per vendor class
+(`GroqService`, `OpenAIService`), so a fix made in one has to be remembered in
+the other. Here that logic is written once; a new vendor is one `ChatProvider`
+instance registered in `PROVIDERS`, not a new class.
+
+Both `openai` and `groq` share the same failure handling. A completion that
+fails with a connection error, a timeout, a rate limit, or a vendor 5xx is
+retried up to `CHATTERLOOP_REPLY_MAX_RETRIES` times (default 3, matching
+Neon's own retry count) with exponential backoff; a rejected key or a bad
+request is never retried, since it will be exactly as rejected on the third
+attempt. If every attempt fails, the bot logs the failure and **stays
+quiet** on that one mention rather than crashing the process or posting a
+public "sorry, something went wrong" — this bot is a member of the group
+chat, not a support desk (see `default_system_prompt`), and an apology for
+every transient hiccup reads as broken rather than busy. That is a deliberate
+departure from Neon, which does post the apology.
+
+#### Function-calling (`CHATTERLOOP_TOOLS`)
+
+Set `CHATTERLOOP_TOOLS_ENABLED=true` and `CHATTERLOOP_TOOLS` (a JSON array) to
+let the model call out to an HTTP endpoint mid-reply — the same capability
+Neon's `Tool`/`trigger_function` gives its agents
+(`llm/models.py`, `llm/utils/function_calls.py`), speaking the current OpenAI
+`tools`/`tool_choice` schema rather than the deprecated `functions` one Neon's
+code uses.
+
+The load-bearing difference from Neon: **tools are defined in this
+deployment's own environment, never a database.** rag_service is a standalone
+developer-API product sitting in front of chatterloop through one
+token-authenticated credential — it has no standing to ask the chatterloop
+system to store or serve config on its behalf, the way an in-house Django app
+can reach into its own Postgres for a `Tool` row. Every tool this bot can call
+is therefore "environment-bounded" exactly like every other credential and
+endpoint in this file already is: per deployment, in `.env`, dynamic without a
+migration.
+
+```
+CHATTERLOOP_TOOLS=[{
+  "name": "get_weather",
+  "description": "Current weather for a city.",
+  "parameters_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+  "api_endpoint": "https://api.example.com/weather",
+  "http_method": "GET",
+  "param_type": "query"
+}]
+```
+
+Three `param_type`s, matching Neon's `Tool.param_type` exactly: `query` (GET
+params), `route` (`.format(**arguments)` into the URL, e.g.
+`".../orders/{order_id}"`), `body` (POST JSON). `headers` are static only —
+never templated from the model's own arguments, so a tool cannot be tricked
+by a prompt injection into forging its own auth header from LLM-controlled
+input.
+
+A tool call never raises. A bad route template, a network failure, a
+non-2xx response — every failure mode becomes `{"error": "..."}`, handed back
+to the model as a normal tool result, so it can apologise or try different
+arguments instead of a reply crashing outright.
+
+`CHATTERLOOP_TOOL_MAX_ITERATIONS` (default 2) caps how many times the model
+may chain tool calls before the pipeline forces a final answer with tools
+switched off — without a cap, a model that keeps asking for "just one more
+call" turns one mention into an unbounded number of outbound requests.
+
+#### Agents (`CHATTERLOOP_AGENTS`) — one bot, several personas it could be
+
+This deployment still answers chatterloop as **exactly one bot** — one
+`CHATTERLOOP_BOT_HANDLE`, one `CHATTERLOOP_BOT_ENTITY_ID`. `CHATTERLOOP_AGENTS`
+does not change that; it does not make several agents answer one mention,
+and it is not a router. What it is: a roster of personas (`config.AgentConfig`
+— system prompt, model override, a subset of `CHATTERLOOP_TOOLS`) this
+deployment could run as, with `CHATTERLOOP_ACTIVE_AGENT` picking exactly one
+at deploy time. Swapping persona is changing that one value and redeploying,
+not rewriting `CHATTERLOOP_TOOLS`/`CHATTERLOOP_REPLY_MODEL`/the prompt by
+hand. That is the sense in which several agents are defined here at once —
+a bench, not a committee.
+
+This is Neon's `Agent` + `Role` folded into one (`llm/models.py`: an `Agent`
+belongs to an `Organization` and has a `Role`; a `Role` carries the
+`system_prompt` and a tools relation) — there is no `Organization` here for
+`Role` to sit across, so no reason to keep them as two objects. What is
+**not** mirrored from Neon on purpose: an agent's `system_prompt` is
+**appended** to the bot's built-in framing (`default_system_prompt`), never
+substituted for it. That framing is not just personality — it is the
+instruction that tells the model retrieved BACKGROUND is memory, not live
+instructions, which is the actual defence against a retrieved chunk
+hijacking the reply. Neon's `Role.system_prompt` carries no such structural
+text to preserve (Neon has no retrieval-augmented BACKGROUND concept at
+all), so replacing it outright was safe there. Doing the same here would
+silently drop that guard the moment an agent defined its own prompt.
+
+Leave `CHATTERLOOP_AGENTS` empty (the default) and nothing changes: the bot
+runs on its own default persona, `CHATTERLOOP_REPLY_MODEL`, and the flat
+`CHATTERLOOP_TOOLS` list, exactly as before this existed.
+
+```
+CHATTERLOOP_AGENTS=[
+  {"id": "support", "name": "Support", "system_prompt": "Be extra concise and practical.", "tool_ids": ["get_weather"]},
+  {"id": "sales", "name": "Sales", "model": "gpt-4o"}
+]
+CHATTERLOOP_ACTIVE_AGENT=support
+```
+
+An agent's `tool_ids` reference `CHATTERLOOP_TOOLS` entries by `name` — there
+is no separate tool id; `name` already has to be unique, since it is the
+function name the model sees. Startup fails loudly, not the first mention,
+if: `CHATTERLOOP_AGENTS` is set with no `CHATTERLOOP_ACTIVE_AGENT`;
+`CHATTERLOOP_ACTIVE_AGENT` names an id that is missing, misspelled, or
+disabled; or any agent (active or not) references a `tool_ids` entry
+`CHATTERLOOP_TOOLS` does not define.
+
+`CHATTERLOOP_TOOLS_ENABLED=false` still wins over everything, active agent
+included — it is the one lever that kills function-calling deployment-wide
+without touching `CHATTERLOOP_AGENTS` or `CHATTERLOOP_TOOLS` at all.
 
 ---
 

@@ -6,19 +6,27 @@ replies only when it was addressed. Each rule below is a separate reason to
 stay silent, evaluated cheapest-first, and each returns a reason string so "why
 didn't it answer?" is answerable from the logs.
 
-TWO WAYS TO BE ADDRESSED, and the second is not a loosening of the first:
+THREE WAYS TO BE ADDRESSED, and the second and third are not a loosening of
+the first:
 
-  * an @mention, which is how a thread with the bot STARTS; and
+  * an @mention, which is how a thread with the bot STARTS in a GROUP;
   * a direct reply to something the bot itself said, which is how one
-    CONTINUES. Requiring the handle on every turn is ceremony no human
-    conversation has, and its absence was the single thing that made the bot
-    read as a command line rather than a participant.
+    CONTINUES in a group. Requiring the handle on every turn is ceremony no
+    human conversation has, and its absence was the single thing that made
+    the bot read as a command line rather than a participant; and
+  * any message at all, in a DM. A single conversation has exactly two
+    participants, so there is no third party a message could instead be
+    small talk between - every message from the other side is already aimed
+    at the bot, the same way every line you type into a 1:1 chat is aimed at
+    whoever else is in it. Neither an @mention nor reply-threading means
+    anything extra there.
 
-What has NOT changed is that both are explicit acts aimed at the bot. A reply
-to somebody else's message in a thread the bot happens to be in is still
-nothing to do with it, and whether a reply's parent belongs to the bot is
-decided by the API from the token's own entity - not here, and not by anything
-a message can claim.
+What has NOT changed is that all three are explicit acts aimed at the bot -
+being A participant in a DM is what makes "any message" mean "addressed",
+not a general loosening of the rule. A reply to somebody else's message in a
+GROUP thread the bot happens to be in is still nothing to do with it, and
+whether a reply's parent belongs to the bot is decided by the API from the
+token's own entity - not here, and not by anything a message can claim.
 """
 
 from __future__ import annotations
@@ -55,10 +63,12 @@ class Decision:
 # thing anyone will want when a reply looks unwarranted.
 RESPOND_MENTIONED = Decision(Verdict.RESPOND, "addressed by mention")
 RESPOND_REPLIED_TO = Decision(Verdict.RESPOND, "direct reply to the bot")
+RESPOND_DM = Decision(Verdict.RESPOND, "message in a direct conversation")
 
 _RESPOND_BY_REASON = {
     TriggerReason.MENTION: RESPOND_MENTIONED,
     TriggerReason.REPLY: RESPOND_REPLIED_TO,
+    TriggerReason.DM: RESPOND_DM,
 }
 
 

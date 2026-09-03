@@ -10,7 +10,7 @@ import json
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Embedding models we know the native dimensionality of. `text-embedding-3-*`
@@ -209,6 +209,84 @@ class MessagingSettings(BaseSettings):
     idempotency_ttl_seconds: int = 86_400
 
 
+class ToolConfig(BaseModel):
+    """One function the reply generator may call, mid-completion.
+
+    Deliberately shaped after NeonCentralized_API's `Tool` model
+    (llm/models.py: name, description, parameters_schema, headers_schema,
+    api_endpoint, http_method, param_type) - that is the tested, working
+    function-calling contract. What differs is where it lives: Neon reads
+    Tool rows from Postgres; this reads a JSON array from CHATTERLOOP_TOOLS.
+    There is no database here to read from, and there should not be one -
+    rag_service is a standalone developer-API product sitting in front of
+    chatterloop, not a module inside it, so it has no standing to ask the
+    chatterloop system to store or serve tool config on its behalf. Every
+    tool this bot can call is therefore defined in ITS OWN environment,
+    per deployment - "environment-bounded" the same way every other
+    credential and endpoint in this file already is.
+    """
+
+    name: str
+    description: str = ""
+    # JSON Schema for the arguments the model must supply. An empty object
+    # schema is a valid "no arguments" tool, not a misconfiguration.
+    parameters_schema: dict = Field(default_factory=lambda: {"type": "object", "properties": {}})
+    api_endpoint: str
+    http_method: Literal["GET", "POST"] = "POST"
+    # "query" -> GET params; "route" -> `.format(**arguments)` into the URL
+    # (e.g. "https://api.example/items/{item_id}"); "body" -> POST JSON.
+    param_type: Literal["query", "route", "body"] = "body"
+    # Static headers only (e.g. a bearer token for a third-party API this
+    # tool calls). Never templated from the model's arguments - a tool that
+    # could inject its OWN auth header from LLM-controlled input would let a
+    # prompt injection reach past whatever that header authorizes.
+    headers: dict[str, str] = Field(default_factory=dict)
+    is_enabled: bool = True
+
+
+class AgentConfig(BaseModel):
+    """One persona this bot can run as.
+
+    Neon's `Agent` + `Role` folded into one (llm/models.py: an Agent belongs
+    to an Organization and has a Role; a Role carries a system_prompt and a
+    tools m2m) - rag_service has no Organization for Role to sit across, so
+    there is no reason to keep them as two objects here.
+
+    This deployment still answers chatterloop as exactly ONE bot - one
+    handle, one Entity id (`bot_handle`/`bot_entity_id` above) - and exactly
+    ONE agent is ever ACTIVE for it, chosen by `active_agent` below. Defining
+    several here is what makes swapping personas an env change (redeploy
+    with a different `CHATTERLOOP_ACTIVE_AGENT`) rather than a config
+    rewrite: a roster this deployment can BE, one at a time - not several
+    agents answering the same mention at once. That per-mention routing is a
+    different, larger feature this does not build; picking the active one is
+    a deploy-time decision, not a runtime one.
+    """
+
+    id: str
+    name: str = ""
+    # APPENDED to the bot's built-in framing (default_system_prompt), never
+    # in place of it. That framing is not just personality - it is what
+    # tells the model retrieved BACKGROUND is memory, not live instructions,
+    # which is the actual defence against a retrieved chunk hijacking the
+    # reply. Neon's Role.system_prompt has no such structural text to
+    # preserve (Neon has no retrieval-augmented BACKGROUND concept at all),
+    # so replacing it outright was safe there. Doing the same here would
+    # silently drop that guard the moment an agent defined its own prompt.
+    system_prompt: str | None = None
+    # None = use CHATTERLOOP_REPLY_MODEL. Unlike Neon, where the CALLER picks
+    # a Model per request (messenger/views.py: `model_uuid` on the payload),
+    # a passive group-chat bot has no such per-message selection surface, so
+    # fixing the model per agent is the adaptation, not a literal mirror.
+    model: str | None = None
+    # References CHATTERLOOP_TOOLS entries by `name` - there is no separate
+    # tool id, `name` already has to be unique (it is the function name the
+    # model sees) so a second identifier would only be one more thing to
+    # keep in sync.
+    tool_ids: list[str] = Field(default_factory=list)
+    is_enabled: bool = True
+
+
 class ChatterloopSettings(BaseSettings):
     """Acting as a user on the chatterloop platform."""
 
@@ -241,6 +319,14 @@ class ChatterloopSettings(BaseSettings):
     # no read at all.
     answer_replies: bool = True
 
+    # Whether EVERY message in a DM (single conversation) counts as addressed -
+    # no @handle, no reply-threading. A single conversation has exactly two
+    # participants, so there is no third party a message could instead be
+    # about. Off, a DM is judged exactly like a group: mention, then (if
+    # answer_replies) the reply probe - so a plain "hey" in a DM goes
+    # unanswered, same as it always did before this existed.
+    answer_dms: bool = True
+
     # How many recent replies the probe looks at per conversation. Bounds the
     # work per frame; the server-side route bounds the scan the same way.
     reply_probe_window: int = 25
@@ -272,9 +358,12 @@ class ChatterloopSettings(BaseSettings):
     history_window: int = 40
     top_k: int = 8
 
-    # "openai" | "stub". The stub reports what was retrieved instead of
-    # composing prose, which keeps retrieval quality debuggable on its own.
-    reply_generator: Literal["openai", "stub"] = "stub"
+    # "openai" | "groq" | "stub". The stub reports what was retrieved
+    # instead of composing prose, which keeps retrieval quality debuggable
+    # on its own. "openai"/"groq" select a `chatterloop.replies.ChatProvider`
+    # by name (see PROVIDERS there) - adding a vendor is registering one more
+    # provider and one more literal here, never rewriting the generator.
+    reply_generator: Literal["openai", "groq", "stub"] = "stub"
     reply_model: str = "gpt-4o-mini"
     reply_api_key: str = ""
     # OpenAI-compatible endpoint override, e.g.
@@ -282,6 +371,35 @@ class ChatterloopSettings(BaseSettings):
     reply_base_url: str = ""
     reply_max_tokens: int = 400
     reply_temperature: float = 0.3
+    # NeonCentralized_API retries a failed completion 3 times before giving
+    # up (messenger/views.py). Same count, same idea - a rate limit or a
+    # dropped connection is the provider having a bad moment, not a reason to
+    # go silent for the rest of the hour.
+    reply_max_retries: int = 3
+
+    # Function-calling. Off by default: a deployment with no tools configured
+    # pays no extra request and behaves exactly as before this existed.
+    tools_enabled: bool = False
+    # JSON array of ToolConfig objects. See ToolConfig's docstring for why
+    # this is env, not a database.
+    tools: list[ToolConfig] = Field(default_factory=list)
+    # Caps how many times the model may chain tool calls before this forces
+    # a final answer with tools switched off. Without a cap, a model that
+    # keeps asking for "just one more call" turns one mention into an
+    # unbounded number of outbound requests.
+    tool_max_iterations: int = 2
+    tool_timeout_seconds: float = 10.0
+
+    # JSON array of AgentConfig objects. Empty (the default) means this
+    # deployment runs exactly as it did before agents existed: the bot's own
+    # default persona, CHATTERLOOP_REPLY_MODEL, and the flat CHATTERLOOP_TOOLS
+    # list - no migration required to adopt this file's newer settings.
+    agents: list[AgentConfig] = Field(default_factory=list)
+    # The id of the one AgentConfig this process runs as. Required (and
+    # validated below) whenever `agents` is non-empty; meaningless, and
+    # rejected, when it is not - an unused setting that happens to be set is
+    # usually a deployment pointing at an agent it thinks is there and isn't.
+    active_agent: str = ""
 
     @field_validator("bot_aliases", "ignore_entity_ids", mode="before")
     @classmethod
@@ -289,6 +407,55 @@ class ChatterloopSettings(BaseSettings):
         if isinstance(v, str):
             return [part.strip() for part in v.split(",") if part.strip()]
         return v
+
+    @field_validator("tools", "agents", mode="before")
+    @classmethod
+    def _parse_json_array(cls, v: object) -> object:
+        if isinstance(v, str):
+            return json.loads(v) if v.strip() else []
+        return v
+
+    @model_validator(mode="after")
+    def _resolve_active_agent(self) -> "ChatterloopSettings":
+        # Fail at startup, not on the first mention: a typo'd id or a
+        # forgotten CHATTERLOOP_ACTIVE_AGENT should be a boot-time error the
+        # deploy log shows immediately, not a bot that answers with its
+        # default persona forever and nobody notices why.
+        tool_names = {t.name for t in self.tools}
+        for agent in self.agents:
+            unknown = [tid for tid in agent.tool_ids if tid not in tool_names]
+            if unknown:
+                raise ValueError(
+                    f"agent {agent.id!r} references unknown tool id(s) {unknown} - "
+                    f"known tools: {sorted(tool_names) or '(none configured)'}"
+                )
+
+        if not self.agents:
+            if self.active_agent:
+                raise ValueError(
+                    "CHATTERLOOP_ACTIVE_AGENT is set but CHATTERLOOP_AGENTS is empty"
+                )
+            return self
+
+        enabled = {a.id: a for a in self.agents if a.is_enabled}
+        if not self.active_agent:
+            raise ValueError(
+                "CHATTERLOOP_AGENTS is configured but CHATTERLOOP_ACTIVE_AGENT is not "
+                f"set - choose one of: {sorted(enabled) or '(none enabled)'}"
+            )
+        if self.active_agent not in enabled:
+            raise ValueError(
+                f"CHATTERLOOP_ACTIVE_AGENT={self.active_agent!r} is not an enabled "
+                f"agent id - choose one of: {sorted(enabled) or '(none enabled)'}"
+            )
+        return self
+
+    @property
+    def active_agent_config(self) -> AgentConfig | None:
+        """The one AgentConfig this process runs as, or None with no agents defined."""
+        if not self.agents:
+            return None
+        return next(a for a in self.agents if a.id == self.active_agent)
 
 
 class PlatformSettings(BaseSettings):

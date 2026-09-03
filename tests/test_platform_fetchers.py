@@ -131,6 +131,40 @@ def _mention(**overrides):
     return row
 
 
+class TestConversationType:
+    """What ChatterloopBot._is_dm relies on to tell a DM from a group."""
+
+    def test_returns_the_type_the_endpoint_reports(self):
+        client = FakeClient({"conversation_type": "single", "messages": []})
+        assert ApiMessageFetcher(client).conversation_type("c1") == "single"
+
+    def test_reuses_the_messages_endpoint_with_a_minimal_limit(self):
+        # NOT a dedicated endpoint - GET /v1/conversations/{id}/messages
+        # already resolves conversation_type for its own membership check,
+        # before it even reads a message. limit=1 asks for the one field
+        # this needs without paying for a full history_window fetch.
+        client = FakeClient({"conversation_type": "group", "messages": []})
+        ApiMessageFetcher(client).conversation_type("c1")
+        assert client.calls == [("/v1/conversations/c1/messages", {"limit": 1})]
+
+    def test_a_missing_field_is_empty_not_a_crash(self):
+        client = FakeClient({"messages": []})
+        assert ApiMessageFetcher(client).conversation_type("c1") == ""
+
+    def test_an_auth_failure_is_empty(self):
+        client = FakeClient(error=PlatformAuthError("nope"))
+        assert ApiMessageFetcher(client).conversation_type("c1") == ""
+
+    def test_a_transient_failure_is_empty(self):
+        client = FakeClient(error=PlatformAPIError("timed out"))
+        assert ApiMessageFetcher(client).conversation_type("c1") == ""
+
+    def test_no_conversation_id_is_never_sent(self):
+        client = FakeClient({"conversation_type": "single"})
+        assert ApiMessageFetcher(client).conversation_type("") == ""
+        assert client.calls == []
+
+
 class TestApiMentionFetcher:
     def test_maps_rows_to_pending_mentions(self):
         client = FakeClient({"mentions": [_mention()]})

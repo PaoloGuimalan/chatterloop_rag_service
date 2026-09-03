@@ -43,7 +43,7 @@ def frame(event="messages_list", *, mentioner=True, sender="human-1",
 
 
 class FakeFetcher:
-    def __init__(self, messages=None, replies=None):
+    def __init__(self, messages=None, replies=None, conversation_type="group"):
         self.messages = messages if messages is not None else [
             PlatformMessage("m1", "conv-1", "human-1", "we agreed on tiered pricing", 1000),
             PlatformMessage("m2", "conv-1", "human-1",
@@ -54,8 +54,18 @@ class FakeFetcher:
         # fake that returned anything else would be testing a shape the bot
         # cannot receive.
         self.replies = replies or []
+        # "group" by default, deliberately NOT "single": every pre-existing
+        # test in this module is about a GROUP conversation exercising the
+        # mention/reply paths, and none of them should start taking the DM
+        # branch just because _is_dm now runs on every unmentioned frame.
+        # Held under a different name than the method below on purpose - the
+        # obvious `self.conversation_type = conversation_type` would shadow
+        # the METHOD of the same name with a plain string, and every call to
+        # it would then raise "'str' object is not callable".
+        self._conversation_type = conversation_type
         self.calls: list[str] = []
         self.reply_calls: list[str] = []
+        self.conversation_type_calls: list[str] = []
 
     def fetch_recent(self, conversation_id, limit):
         self.calls.append(conversation_id)
@@ -64,6 +74,10 @@ class FakeFetcher:
     def fetch_replies_to_me(self, conversation_id, limit):
         self.reply_calls.append(conversation_id)
         return list(self.replies)
+
+    def conversation_type(self, conversation_id):
+        self.conversation_type_calls.append(conversation_id)
+        return self._conversation_type
 
 
 class FakeMentionFetcher:
@@ -547,6 +561,13 @@ class TestReplyingWithoutAHandle:
             def fetch_replies_to_me(self, conversation_id, limit):
                 raise RuntimeError("service down")
 
+            def conversation_type(self, conversation_id):
+                # "group", not raising: this test is specifically about the
+                # REPLY probe failing, which only runs once _is_dm has
+                # already said "not a DM" - a raise here would test a
+                # different failure than the one this test names.
+                return "group"
+
         b = self._bot(replies=[])
         b.message_fetcher = Exploding()
         b.handle_envelope(frame(mentioner=False))
@@ -669,6 +690,188 @@ class TestCommentReplies:
         ])
         b.handle_envelope(frame(event="notifications"))
         assert b.responder.sent[0]["comment_id"] == "a-reply"
+
+
+class TestDirectMessages:
+    """The third way in: any message at all, in a single conversation.
+
+    No @handle, no reply-threading - a DM has exactly two participants, so a
+    plain unaddressed message is still the bot being talked to. The frame
+    itself never says a conversation is single (see frames.py), so every test
+    here goes through FakeFetcher.conversation_type rather than the frame's
+    own `mentioner` field.
+    """
+
+    def _bot(self, history=None, conversation_type="single", **kw):
+        return ChatterloopBot(
+            identity=BOT, policy=AddressedOnlyPolicy(BOT, cooldown_seconds=0.0),
+            started_at_ms=0,
+            ingestion=FakeIngestion(), retrieval=FakeRetrieval(),
+            generator=FakeGenerator(), responder=RecordingResponder(),
+            message_fetcher=FakeFetcher(
+                messages=history, conversation_type=conversation_type
+            ),
+            mention_fetcher=FakeMentionFetcher(), **kw,
+        )
+
+    def test_a_plain_message_with_no_handle_is_answered(self):
+        b = self._bot(history=[
+            PlatformMessage("m1", "conv-1", "human-1", "hey, you around?", 1000),
+        ])
+        b.handle_envelope(frame(mentioner=False))
+        assert b.responder.sent == [{
+            "kind": "conversation", "conversation_id": "conv-1",
+            "text": "Tiered pricing.",
+            "reply_to_message_id": "m1",
+        }]
+
+    def test_the_query_is_the_message_itself_with_nothing_stripped(self):
+        # strip_mentions is a no-op here - there is no @handle in a plain DM
+        # message to begin with - but the query still has to equal the text.
+        b = self._bot(history=[
+            PlatformMessage("m1", "conv-1", "human-1", "what did we agree on?", 1000),
+        ])
+        b.handle_envelope(frame(mentioner=False))
+        assert b.generator.calls == ["what did we agree on?"]
+
+    def test_history_is_indexed_on_the_dm_path(self):
+        history = [PlatformMessage("m1", "conv-1", "human-1", "hey", 1000)]
+        b = self._bot(history=history)
+        b.handle_envelope(frame(mentioner=False))
+        assert len(b.ingestion.indexed) == 1
+
+    def test_a_non_single_conversation_does_not_take_this_path(self):
+        # conversation_type="group" (FakeFetcher's own default) - the DM
+        # branch must not fire just because a message has no @handle; that is
+        # what the reply probe below still exists to judge.
+        b = self._bot(conversation_type="group")
+        b.handle_envelope(frame(mentioner=False))
+        assert b.responder.sent == []
+        assert b.message_fetcher.reply_calls == ["conv-1"]
+
+    def test_the_newest_message_from_the_other_side_wins(self):
+        # Between the frame arriving and this fetch completing, the other
+        # side may have said something newer - that is the thing worth
+        # answering, same reasoning _resolve_mention_trigger uses.
+        b = self._bot(history=[
+            PlatformMessage("m1", "conv-1", "human-1", "hey", 1000),
+            PlatformMessage("m2", "conv-1", "human-1", "actually never mind, what about this instead?", 2000),
+        ])
+        b.handle_envelope(frame(mentioner=False))
+        assert b.generator.calls == ["actually never mind, what about this instead?"]
+
+    def test_the_bots_own_messages_are_never_taken_as_the_addressing_one(self):
+        b = self._bot(history=[
+            PlatformMessage("m1", "conv-1", "human-1", "hey", 1000),
+            PlatformMessage("bot-m1", "conv-1", "bot-1", "hi there!", 2000),
+        ])
+        b.handle_envelope(frame(mentioner=False))
+        # The bot's own "hi there!" must not be answered as if it were the
+        # human's message - the human's "hey" is the only real question here.
+        assert b.generator.calls == ["hey"]
+
+    def test_conversation_type_is_cached_after_the_first_message(self):
+        b = self._bot(history=[
+            PlatformMessage("m1", "conv-1", "human-1", "hey", 1000),
+        ])
+        b.handle_envelope(frame(mentioner=False, conversation="conv-1"))
+        b.handle_envelope(frame(mentioner=False, conversation="conv-1", sender="human-1"))
+        assert b.message_fetcher.conversation_type_calls == ["conv-1"]
+
+    def test_a_second_conversation_is_resolved_independently(self):
+        b = self._bot(history=[
+            PlatformMessage("m1", "conv-1", "human-1", "hey", 1000),
+        ])
+        b.handle_envelope(frame(mentioner=False, conversation="conv-1"))
+        b.handle_envelope(frame(mentioner=False, conversation="conv-2"))
+        assert b.message_fetcher.conversation_type_calls == ["conv-1", "conv-2"]
+
+    def test_an_unresolvable_conversation_type_is_not_cached(self):
+        class Unresolvable:
+            def __init__(self):
+                self.type_calls = 0
+
+            def fetch_recent(self, conversation_id, limit):
+                return []
+
+            def fetch_replies_to_me(self, conversation_id, limit):
+                return []
+
+            def conversation_type(self, conversation_id):
+                self.type_calls += 1
+                return ""  # a read failure, or no fetcher configured
+
+        b = self._bot()
+        b.message_fetcher = Unresolvable()
+        b.handle_envelope(frame(mentioner=False))
+        b.handle_envelope(frame(mentioner=False))
+        # Retried both times, not cached as "not a DM" forever on the
+        # strength of one failed read.
+        assert b.message_fetcher.type_calls == 2
+
+    def test_an_atmention_in_a_dm_still_takes_the_mention_path(self):
+        # mentioner is set on the frame here (the default), so this never
+        # reaches _is_dm at all - an explicit @handle still works exactly as
+        # it always has, DM or not.
+        b = self._bot(history=[
+            PlatformMessage("m1", "conv-1", "human-1", "@assistant hey", 1000),
+        ])
+        b.handle_envelope(frame(mentioner=True))
+        assert len(b.responder.sent) == 1
+        assert b.message_fetcher.conversation_type_calls == []
+
+    def test_the_feature_can_be_turned_off_entirely(self):
+        b = self._bot(
+            history=[PlatformMessage("m1", "conv-1", "human-1", "hey", 1000)],
+            answer_dms=False,
+            answer_replies=False,
+        )
+        b.handle_envelope(frame(mentioner=False))
+        assert b.responder.sent == []
+        # Off means off - not even the conversation_type read happens.
+        assert b.message_fetcher.conversation_type_calls == []
+
+    def test_turning_it_off_falls_back_to_the_reply_probe(self):
+        b = self._bot(conversation_type="single", answer_dms=False)
+        b.handle_envelope(frame(mentioner=False))
+        # Judged as a group would be: no DM shortcut, straight to the probe.
+        assert b.message_fetcher.reply_calls == ["conv-1"]
+        assert b.responder.sent == []
+
+    def test_a_dm_trigger_is_counted_under_its_own_reason(self):
+        b = self._bot(history=[
+            PlatformMessage("m1", "conv-1", "human-1", "hey", 1000),
+        ])
+        b.handle_envelope(frame(mentioner=False))
+        assert b.stats.trigger_reasons.get("dm") == 1
+
+    def test_a_redelivered_frame_is_answered_once(self):
+        # The same dedupe_key mechanism every other path relies on - keyed on
+        # the addressing message id, set by _attach regardless of how the
+        # trigger got there.
+        b = self._bot(history=[
+            PlatformMessage("m1", "conv-1", "human-1", "hey", 1000),
+        ])
+        b.handle_envelope(frame(mentioner=False))
+        b.handle_envelope(frame(mentioner=False))
+        assert len(b.responder.sent) == 1
+
+    def test_a_failing_conversation_type_read_is_contained(self):
+        class Exploding:
+            def fetch_recent(self, conversation_id, limit):
+                return []
+
+            def fetch_replies_to_me(self, conversation_id, limit):
+                return []
+
+            def conversation_type(self, conversation_id):
+                raise RuntimeError("service down")
+
+        b = self._bot()
+        b.message_fetcher = Exploding()
+        b.handle_envelope(frame(mentioner=False))
+        assert b.stats.errors == 1
+        assert b.responder.sent == []
 
 
 class TestLiveEventsOnly:

@@ -148,6 +148,7 @@ class ChatterloopBot:
         history_window: int = 40,
         top_k: int = 8,
         answer_replies: bool = True,
+        answer_dms: bool = True,
         reply_probe_window: int = 25,
         only_live_events: bool = True,
         started_at_ms: int | None = None,
@@ -166,9 +167,21 @@ class ChatterloopBot:
         # exactly what it was before: mention-only, one early return, and no
         # read at all on a message that did not name it.
         self.answer_replies = answer_replies
+        # The kill switch for treating EVERY message in a DM as addressed, no
+        # @handle or reply-threading needed. Off, a DM is judged exactly like
+        # a group: mention, then (if answer_replies) the reply probe - which
+        # means a plain "hey" in a DM goes unanswered, same as it always did.
+        self.answer_dms = answer_dms
         # How many recent replies the probe looks at. Bounds the work per
         # frame, not the conversation - see RepliesTo in developer_service.
         self.reply_probe_window = reply_probe_window
+        # conversation_id -> conversation_type, resolved once and kept
+        # forever: the platform never changes a conversation's type after
+        # creation, so this is one read per conversation over the bot's whole
+        # lifetime, not one per unaddressed message. Only definitive results
+        # are cached - see _is_dm - so a transient read failure retries on
+        # the next message instead of wrongly answering "not a DM" forever.
+        self._conversation_types: dict[str, str] = {}
         # The watermark. Anything resolved from a READ that predates this is
         # backlog, not traffic - see the module docstring.
         self.only_live_events = only_live_events
@@ -259,13 +272,79 @@ class ChatterloopBot:
             self._guard(trigger, self._resolve_mention_trigger)
             return
 
-        # No mention. The message may still be a direct reply to something the
-        # bot said, which the frame cannot tell us - so this is where the extra
-        # read lives, and where it stops if the feature is off.
+        # No mention on the frame. In a DM that is not evidence of anything -
+        # the bot is one of exactly two participants, so a message with no
+        # @handle is still aimed at it, the same way typing into any other 1:1
+        # chat is. Checked BEFORE the reply probe below: a DM needs neither an
+        # @mention nor reply-threading, so there is nothing for that probe to
+        # add here, only a read to skip.
+        if self.answer_dms and self._is_dm(payload.conversationID):
+            trigger = Trigger(
+                source=TriggerSource.MESSAGE,
+                reason=TriggerReason.DM,
+                author_entity_id=payload.entityID,
+                conversation_id=payload.conversationID,
+                is_single=True,
+                occurred_at=envelope.dateTime,
+            )
+            self.stats.note_trigger(str(trigger.reason))
+            self._guard(trigger, self._resolve_dm_trigger)
+            return
+
+        # Not a DM either. The message may still be a direct reply to
+        # something the bot said, which the frame cannot tell us - so this is
+        # where the extra read lives, and where it stops if the feature is
+        # off.
         if not self.answer_replies:
             return
 
         self._probe_for_reply(payload, envelope)
+
+    def _is_dm(self, conversation_id: str) -> bool:
+        """Whether this conversation has exactly two participants: the bot,
+        and whoever it is talking to.
+
+        Cached forever once known - see `_conversation_types` in __init__. A
+        cache miss costs one small read (`MessageFetcher.conversation_type`,
+        `limit=1`); after that, every future message in the SAME conversation
+        is free. A GROUP the bot is freshly added to still pays this once, on
+        its first unaddressed message - there is no way around that, since
+        nothing on the realtime frame says what kind of conversation it is
+        (see frames.py's MessagesListPayload) - but every message after the
+        first is not this method's problem any more.
+        """
+        cached = self._conversation_types.get(conversation_id)
+        if cached is not None:
+            return cached == "single"
+
+        # Guarded the same way _probe_for_reply guards its own fetch: a read
+        # against the platform can fail for reasons that have nothing to do
+        # with this frame, and one bad conversation must not stop the bot
+        # reading the next one. Unguarded, this exception would propagate out
+        # of _on_messages_list uncaught (handle_envelope wraps nothing around
+        # it) and take the whole process down over a single flaky read.
+        try:
+            conversation_type = self.message_fetcher.conversation_type(conversation_id)
+        except Exception as exc:
+            self.stats.errors += 1
+            logger.exception(
+                "failed resolving conversation type",
+                extra={"conversation_id": conversation_id, "error": str(exc)},
+            )
+            return False
+
+        if not conversation_type:
+            # Unresolvable - no fetcher configured, or the read failed. Do NOT
+            # cache a guess (a transient failure must not become a permanent
+            # misclassification), and default to "not a DM": falling through
+            # to the reply probe is the safe direction to be wrong in, since
+            # an unnamed message there still gets a chance to be answered
+            # instead of this method silently claiming DM status it cannot
+            # back up.
+            return False
+
+        self._conversation_types[conversation_id] = conversation_type
+        return conversation_type == "single"
 
     def _probe_for_reply(self, payload, envelope) -> None:
         """Ask the API whether that message was threaded under one of ours."""
@@ -386,6 +465,38 @@ class ChatterloopBot:
             "mention reported but not found in fetched history",
             extra={"conversation_id": trigger.conversation_id},
         )
+
+    def _resolve_dm_trigger(self, trigger: Trigger) -> None:
+        """Fetch the conversation, index it, and take the newest message from
+        the other side - unlike a mention, with no addressing check at all.
+
+        A single conversation has exactly two participants, so "not the bot"
+        and "the person who sent the triggering message" are the same set -
+        there is no group of other people `is_addressed_to` would need to
+        rule out. Scanning back rather than taking the last message outright
+        for the same reason `_resolve_mention_trigger` does: between the
+        frame arriving and this fetch completing, the other side may have
+        sent something newer, and that is the thing actually worth answering.
+        """
+        history = self.message_fetcher.fetch_recent(
+            trigger.conversation_id, self.history_window
+        )
+        if not history:
+            return
+
+        self._index(trigger.conversation_id, history)
+
+        for message in reversed(history):
+            if self.identity.is_self(message.sender_entity_id):
+                continue
+            trigger.author_handle = normalise_handle(message.sender_handle)
+            self._attach(trigger, message)
+            return
+
+        # Every message in the fetched window was the bot's own - it has
+        # nothing to answer yet, not a failure. Distinct from the mention
+        # case's log line above: that one means "the API and this fetch
+        # disagree", which this does not.
 
     def _resolve_reply_trigger(self, trigger: Trigger, message: PlatformMessage) -> None:
         """Attach the already-identified reply, then index around it.

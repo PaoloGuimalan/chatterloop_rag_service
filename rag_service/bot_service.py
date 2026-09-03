@@ -23,11 +23,13 @@ from .chatterloop.ports import (
     RecordingResponder,
 )
 from .chatterloop.replies import (
-    OpenAIReplyGenerator,
+    PROVIDERS,
     ReplyGenerator,
     StubReplyGenerator,
+    build_reply_generator,
     default_system_prompt,
 )
+from .chatterloop.single_instance import SingleInstanceLock
 from .chunking import TokenChunker, default_tokenizer
 from .config import Settings, get_settings
 from .embeddings import build_embedder
@@ -41,18 +43,53 @@ logger = logging.getLogger(__name__)
 
 def build_generator(settings: Settings) -> ReplyGenerator:
     cfg = settings.chatterloop
-    if cfg.reply_generator == "openai":
+    # Any registered ChatProvider name works here unchanged - switching
+    # CHATTERLOOP_REPLY_GENERATOR from "openai" to "groq" (or a future
+    # vendor added to chatterloop.replies.PROVIDERS) needs no change in this
+    # function. Only "stub" is special: it names no provider, it names the
+    # absence of one.
+    if cfg.reply_generator in PROVIDERS:
         key = cfg.reply_api_key or settings.embedding.api_key
+        agent = cfg.active_agent_config
+
+        # Addressed by name: the bot is a named participant, and a reply
+        # reads wrong when the model does not know who it is. An active
+        # agent's own system_prompt is APPENDED here, never substituted -
+        # see AgentConfig's docstring for why that framing has to survive.
+        system_prompt = default_system_prompt(cfg.bot_handle)
+        if agent and agent.system_prompt:
+            system_prompt = f"{system_prompt}\n\n{agent.system_prompt}"
+
+        model = (agent.model if agent else None) or cfg.reply_model
+
+        # tools_enabled is the master switch regardless of an active agent:
+        # it lets an operator kill function-calling for a moment (an
+        # incident, a bad tool) without editing CHATTERLOOP_AGENTS or
+        # CHATTERLOOP_TOOLS. With an agent active, its own tool_ids narrow
+        # the flat CHATTERLOOP_TOOLS list to what THIS persona may call -
+        # config.py already rejected any id that does not resolve, so the
+        # lookup below cannot KeyError.
+        if not cfg.tools_enabled:
+            tools = None
+        elif agent:
+            tools_by_name = {t.name: t for t in cfg.tools}
+            tools = [tools_by_name[tool_id] for tool_id in agent.tool_ids]
+        else:
+            tools = cfg.tools
+
         try:
-            return OpenAIReplyGenerator(
+            return build_reply_generator(
+                cfg.reply_generator,
                 api_key=key,
-                model=cfg.reply_model,
-                # Addressed by name: the bot is a named participant, and a
-                # reply reads wrong when the model does not know who it is.
-                system_prompt=default_system_prompt(cfg.bot_handle),
+                model=model,
+                system_prompt=system_prompt,
                 max_tokens=cfg.reply_max_tokens,
                 temperature=cfg.reply_temperature,
                 base_url=cfg.reply_base_url or None,
+                max_retries=cfg.reply_max_retries,
+                tools=tools,
+                tool_max_iterations=cfg.tool_max_iterations,
+                tool_timeout_seconds=cfg.tool_timeout_seconds,
             )
         except Exception as exc:
             # The reason goes in the MESSAGE, not an `extra`. This fallback is
@@ -72,6 +109,15 @@ class ChatterloopBotService:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
         cfg = self.settings.chatterloop
+
+        # Fails fast, before Milvus, before the embedder, before anything -
+        # a duplicate launch should cost milliseconds, not several seconds of
+        # setup work thrown away the moment it turns out a peer is already
+        # running. See single_instance.py for WHY this exists: the dedup
+        # further down (AddressedOnlyPolicy) cannot protect against a second
+        # PROCESS, only a second delivery inside one.
+        self._instance_lock = SingleInstanceLock(cfg.bot_entity_id)
+        self._instance_lock.acquire()
 
         self.identity = BotIdentity(
             entity_id=cfg.bot_entity_id,
@@ -123,6 +169,7 @@ class ChatterloopBotService:
             history_window=cfg.history_window,
             top_k=cfg.top_k,
             answer_replies=cfg.answer_replies,
+            answer_dms=cfg.answer_dms,
             reply_probe_window=cfg.reply_probe_window,
             only_live_events=cfg.only_live_events,
         )
@@ -176,7 +223,16 @@ class ChatterloopBotService:
                 extra={
                     "entity_id": who.get("entity_id"),
                     "handle": who.get("handle"),
-                    "scopes": (who.get("token") or {}).get("scopes"),
+                    # scopes sits beside "token" in the response, not inside
+                    # it - {"entity_id", "handle", "scopes", "token": {"id",
+                    # "name"}}. Reading it off `token` always returned None,
+                    # silently defeating the point of this log line: it
+                    # exists so a token missing a scope it needs shows up
+                    # here, at startup, rather than as an unexplained
+                    # "reply could not be delivered" three hours later.
+                    # Verified against a real GET /v1/whoami response before
+                    # fixing this, not assumed from the client code alone.
+                    "scopes": who.get("scopes"),
                 },
             )
         except Exception as exc:
@@ -215,6 +271,20 @@ class ChatterloopBotService:
 
         return HttpResponder(self._client)
 
+    def _active_tool_names(self) -> list[str]:
+        """What the running generator can actually call - for the startup log.
+
+        Mirrors `build_generator`'s own narrowing: the active agent's
+        `tool_ids`, or the full CHATTERLOOP_TOOLS registry with no agent
+        configured. Kept in sync with that function rather than reading the
+        generator's private state back out of it.
+        """
+        cfg = self.settings.chatterloop
+        agent = cfg.active_agent_config
+        if agent:
+            return list(agent.tool_ids)
+        return [t.name for t in cfg.tools if t.is_enabled]
+
     def install_signal_handlers(self) -> None:
         def handle(signum: int, _frame: object) -> None:
             logger.info("shutdown signal received", extra={"signal": signum})
@@ -247,7 +317,24 @@ class ChatterloopBotService:
                 "handle": self.identity.handle,
                 "channel": self.identity.channel,
                 "responder": type(self.responder).__name__,
-                "generator": type(self.bot.generator).__name__,
+                # The config value, not type(...).__name__: build_reply_generator
+                # returns the same ChatCompletionReplyGenerator class for every
+                # vendor (that's the point - see chatterloop.replies.ChatProvider),
+                # so the class name alone can no longer tell openai from groq.
+                "generator": self.settings.chatterloop.reply_generator,
+                # None = the flat CHATTERLOOP_TOOLS/CHATTERLOOP_AGENTS setup
+                # never adopted the agent layer at all - distinct from "" or
+                # an empty string, which would say an agent IS active but
+                # happens to have no id, a state config.py already refuses.
+                "active_agent": self.settings.chatterloop.active_agent or None,
+                # 0 tools is a legitimate, common state - logged anyway so
+                # "why didn't it call anything?" starts here, not in a
+                # transcript. Reflects what THIS run actually has available -
+                # an active agent's own tool_ids, not the full registry.
+                "tools_enabled": self.settings.chatterloop.tools_enabled,
+                "tools": sorted(self._active_tool_names())
+                if self.settings.chatterloop.tools_enabled
+                else [],
                 "answer_replies": self.bot.answer_replies,
                 "only_live_events": self.bot.only_live_events,
                 # The watermark every read-resolved candidate is judged
@@ -269,7 +356,7 @@ class ChatterloopBotService:
         # The API client holds no pooled connection to close - urllib opens
         # and closes per request - so the datastore handles that used to be
         # shut down here are simply gone.
-        for closable in (self.consumer, self.store):
+        for closable in (self.consumer, self.store, self._instance_lock):
             if closable is None:
                 continue
             try:

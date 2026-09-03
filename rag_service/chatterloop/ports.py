@@ -136,6 +136,22 @@ class MessageFetcher(Protocol):
         """
         ...
 
+    def conversation_type(self, conversation_id: str) -> str:
+        """ "single" for a DM, something else for anything with a third party.
+
+        Empty means unresolvable - no fetcher configured, or the read failed -
+        and callers must not treat that as an answer either way. This is its
+        own method rather than a field folded onto `fetch_recent`'s messages
+        (which would mean paying for `history_window` messages just to learn
+        one fact about the conversation) or onto every `PlatformMessage`
+        (which would mean carrying a whole-conversation property on each of
+        many individual messages). A conversation's type never changes once
+        created, so a caller is expected to CACHE a resolved value rather than
+        calling this on every message - it exists to answer that question
+        once per conversation, not once per event.
+        """
+        ...
+
 
 @runtime_checkable
 class MentionFetcher(Protocol):
@@ -187,6 +203,9 @@ class NullMessageFetcher:
         self, conversation_id: str, limit: int
     ) -> list[PlatformMessage]:
         return []
+
+    def conversation_type(self, conversation_id: str) -> str:
+        return ""
 
 
 class NullMentionFetcher:
