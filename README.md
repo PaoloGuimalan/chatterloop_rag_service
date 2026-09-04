@@ -122,6 +122,22 @@ make bootstrap        # create the collection and indexes
 make worker           # run the consumer in the foreground
 ```
 
+**Self-hosted Milvus vs Zilliz Cloud** is one toggle, not a code change —
+`MILVUS_DEPLOYMENT` in `.env` (`self_hosted` | `zilliz_cloud`), matching
+`CHATTERLOOP_REPLY_GENERATOR`'s vendor-switch pattern above. `pymilvus`
+already speaks to both identically through `MILVUS_URI`/`MILVUS_TOKEN`, so
+this changes no code path — it only names which one you're pointed at and,
+usefully, fails at startup rather than after a mysterious connection error if
+you pick `zilliz_cloud` and forget `MILVUS_TOKEN` (Zilliz Cloud always
+requires one).
+
+It also drives `make up`: `.env`'s `COMPOSE_PROFILES=self-hosted` is what
+actually brings up `etcd`/`minio`/`milvus` (they're tagged with that Compose
+profile). Move to `zilliz_cloud` and comment that line out, and `make up`
+starts only `redis` — there's nothing local left to run for Milvus once
+Zilliz Cloud hosts it. See `.env.example` for both blocks side by side and
+`docker-compose.yml`'s header comment for the mechanics.
+
 Smoke test it without writing a producer:
 
 ```bash

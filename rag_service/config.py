@@ -27,6 +27,22 @@ class MilvusSettings(BaseSettings):
         env_prefix="MILVUS_", env_file=".env", env_ignore_empty=True, extra="ignore"
     )
 
+    # Which Milvus this deployment talks to. Not read by the client itself -
+    # pymilvus's MilvusClient(uri, token, db_name) already speaks to a
+    # self-hosted server and to Zilliz Cloud through the identical call, so
+    # this flag changes no code path in store/milvus_store.py. What it DOES
+    # do is turn "self-hosted vs cloud" into one named setting instead of an
+    # implicit fact you infer from what `uri` happens to look like, and let
+    # this class fail loud on the one mistake that combination allows: cloud
+    # with no token, below.
+    #
+    # It also drives docker-compose.yml's `self-hosted` profile - see
+    # COMPOSE_PROFILES in .env.example. Compose reads that variable from the
+    # SAME .env file this class reads MILVUS_DEPLOYMENT from, so the two stay
+    # in sync by construction: flip one value, both the client and `docker
+    # compose up` change their idea of where Milvus lives.
+    deployment: Literal["self_hosted", "zilliz_cloud"] = "self_hosted"
+
     uri: str = "http://localhost:19530"
     token: str = ""
     db_name: str = "default"
@@ -63,6 +79,22 @@ class MilvusSettings(BaseSettings):
     shards: int = 1
     consistency_level: Literal["Strong", "Bounded", "Session", "Eventually"] = "Bounded"
     load_on_start: bool = True
+
+    @model_validator(mode="after")
+    def _require_token_for_cloud(self) -> "MilvusSettings":
+        # A self-hosted Milvus with no auth configured is the normal case
+        # (the docker-compose stack sets none up) - MILVUS_TOKEN empty is
+        # not a mistake there, so self_hosted is never rejected on this.
+        # Zilliz Cloud always requires an API key; an empty token here is not
+        # "unauthenticated cloud access", it is a forgotten credential, and
+        # would otherwise surface many requests later as an opaque connection
+        # failure instead of an immediate, obvious one at boot.
+        if self.deployment == "zilliz_cloud" and not self.token:
+            raise ValueError(
+                "MILVUS_DEPLOYMENT=zilliz_cloud requires MILVUS_TOKEN - "
+                "Zilliz Cloud does not accept unauthenticated connections"
+            )
+        return self
 
 
 class EmbeddingSettings(BaseSettings):

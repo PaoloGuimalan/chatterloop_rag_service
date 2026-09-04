@@ -14,11 +14,11 @@ lint: ## ruff check + format check
 	./.venv/bin/ruff check rag_service tests
 	./.venv/bin/ruff format --check rag_service tests
 
-up: ## start milvus + redis
-	docker compose up -d etcd minio milvus redis
+up: ## start redis, plus milvus+etcd+minio if COMPOSE_PROFILES=self-hosted (.env)
+	docker compose up -d
 
-down: ## stop everything
-	docker compose down
+down: ## stop everything, including containers left from a profile you've since switched off
+	docker compose down --remove-orphans
 
 logs: ## follow worker logs
 	docker compose logs -f worker

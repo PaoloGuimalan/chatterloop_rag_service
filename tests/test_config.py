@@ -48,6 +48,26 @@ class TestDimensionResolution:
         assert EmbeddingSettings(model="some-private-model", dim=768).dim == 768
 
 
+class TestMilvusDeployment:
+    def test_self_hosted_needs_no_token(self, monkeypatch):
+        monkeypatch.setenv("MILVUS_DEPLOYMENT", "self_hosted")
+        monkeypatch.setenv("MILVUS_TOKEN", "")
+        assert MilvusSettings().deployment == "self_hosted"
+
+    def test_zilliz_cloud_without_a_token_fails_loud_at_startup(self, monkeypatch):
+        monkeypatch.setenv("MILVUS_DEPLOYMENT", "zilliz_cloud")
+        monkeypatch.setenv("MILVUS_TOKEN", "")
+        with pytest.raises(ValueError, match="MILVUS_TOKEN"):
+            MilvusSettings()
+
+    def test_zilliz_cloud_with_a_token_is_accepted(self, monkeypatch):
+        monkeypatch.setenv("MILVUS_DEPLOYMENT", "zilliz_cloud")
+        monkeypatch.setenv("MILVUS_TOKEN", "a-real-api-key")
+        settings = MilvusSettings()
+        assert settings.deployment == "zilliz_cloud"
+        assert settings.token == "a-real-api-key"
+
+
 class TestTenantKeys:
     def test_json_string_is_parsed(self, monkeypatch):
         monkeypatch.setenv("EMBEDDING_TENANT_KEYS", '{"org_a": "sk-a"}')
